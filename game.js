@@ -29,12 +29,18 @@ const hpText = document.getElementById("hpText");
 const levelText = document.getElementById("levelText");
 const xpText = document.getElementById("xpText");
 const killsText = document.getElementById("killsText");
+const scoreText = document.getElementById("scoreText");
 const timeText = document.getElementById("timeText");
 const waveText = document.getElementById("waveText");
 const weaponText = document.getElementById("weaponText");
 const message = document.getElementById("message");
+const comboHud = document.getElementById("comboHud");
+const comboFlame = document.getElementById("comboFlame");
+const comboText = document.getElementById("comboText");
+const comboMultText = document.getElementById("comboMultText");
 
 const overlay = document.getElementById("overlay");
+const overlayCard = overlay.querySelector(".overlay-card");
 const overlayTitle = document.getElementById("overlayTitle");
 const overlayText = document.getElementById("overlayText");
 const upgradeOptions = document.getElementById("upgradeOptions");
@@ -55,8 +61,11 @@ const DASH_SPEED = 780;
 const DASH_COOLDOWN = 1.05;
 const DASH_IFRAME_DURATION = 0.09;
 const DASH_TRAIL_COLORS = ["#5ec8ff", "#7ad4ff", "#9ee0ff", "#cfefff"];
+const COMBO_RESET_TIME = 2.4;
+const COMBO_TIER_STEP = 3;
 const LEADERBOARD_KEY = "rogueZLeaderboardV1";
 const LEADERBOARD_MAX = 5;
+const CODEX_PROGRESS_KEY = "rogueZCodexV1";
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 
 let currentLocale = "zh-CN";
@@ -126,9 +135,11 @@ const hudLblHp = document.getElementById("hudLblHp");
 const hudLblLevel = document.getElementById("hudLblLevel");
 const hudLblXp = document.getElementById("hudLblXp");
 const hudLblKills = document.getElementById("hudLblKills");
+const hudLblScore = document.getElementById("hudLblScore");
 const hudLblTime = document.getElementById("hudLblTime");
 const hudLblWave = document.getElementById("hudLblWave");
 const hudLblWeapons = document.getElementById("hudLblWeapons");
+const hudLblCombo = document.getElementById("hudLblCombo");
 
 function applyStaticPageStrings() {
   document.title = t("meta.title");
@@ -185,6 +196,9 @@ function refreshHudLabels() {
   if (hudLblKills) {
     hudLblKills.textContent = t("hud.kills");
   }
+  if (hudLblScore) {
+    hudLblScore.textContent = t("hud.score");
+  }
   if (hudLblTime) {
     hudLblTime.textContent = t("hud.time");
   }
@@ -193,6 +207,9 @@ function refreshHudLabels() {
   }
   if (hudLblWeapons) {
     hudLblWeapons.textContent = t("hud.weapons");
+  }
+  if (hudLblCombo) {
+    hudLblCombo.textContent = t("hud.combo");
   }
 }
 
@@ -203,6 +220,12 @@ function applyLanguageToOpenOverlay() {
   switch (state.phase) {
     case "menu":
       openMainMenuOverlay();
+      break;
+    case "menu_codex":
+      showCodexRootFromMenu();
+      break;
+    case "menu_codex_category":
+      showCodexCategoryFromMenu(state.codex.category);
       break;
     case "paused":
       showPauseMenu();
@@ -300,6 +323,28 @@ const weaponDefinitions = {
       };
     },
   },
+  plasma: {
+    maxLevel: 6,
+    getStats(level, player) {
+      return {
+        damage: (22 + (level - 1) * 5.5) * player.damageMultiplier,
+        cooldown: Math.max(0.48, 0.96 * Math.pow(0.93, level - 1)) / player.fireRate,
+        range: 290 + level * 24,
+        speed: 560 + level * 18,
+        projectiles: 1,
+        spread: 0.03,
+        pierce: 0,
+        size: 6 + level * 0.25,
+        color: "#8ef6ff",
+        chainRange: 120 + level * 10,
+        chainTargets: 2 + Math.floor(level / 2),
+        chainDamageFactor: 0.62 + level * 0.03,
+        chainDecay: 0.86,
+        slowMultiplier: Math.max(0.48, 0.72 - level * 0.03),
+        slowDuration: 1.1 + level * 0.14,
+      };
+    },
+  },
 };
 
 const state = {
@@ -310,17 +355,34 @@ const state = {
   kills: 0,
   spawnTimer: 0,
   pendingLevelUps: 0,
+  score: 0,
   enemies: [],
   projectiles: [],
   pickups: [],
   damageTexts: [],
   dashTrailParticles: [],
+  laserHitParticles: [],
+  chainArcs: [],
   lastGameOver: null,
+  combo: {
+    count: 0,
+    timer: 0,
+    multiplier: 1,
+    pulse: 0,
+    tier: 0,
+  },
   player: null,
   boss: null,
   bossSpawnedInWave: false,
   nextEnemyId: 1,
   waveAnnouncementTimer: 0,
+  codex: {
+    discoveredWeapons: new Set(),
+    discoveredEnemies: new Set(),
+    category: "weapons",
+    page: 0,
+    pageSize: 6,
+  },
   touch: {
     active: false,
     id: null,
@@ -329,10 +391,13 @@ const state = {
   },
   audio: {
     context: null,
+    outputGainNode: null,
     lastShootAt: 0,
     lastHitAt: 0,
     lastLaserHumAt: 0,
+    lastPlasmaHitAt: 0,
     volume: 1,
+    outputBoost: 2.35,
   },
 };
 
@@ -376,10 +441,58 @@ function createPlayer() {
   };
 }
 
+function getComboTier(count) {
+  return Math.floor(Math.max(0, count - 1) / COMBO_TIER_STEP);
+}
+
+function getComboMultiplier(count) {
+  const chain = Math.max(0, count - 1);
+  const tier = Math.floor(chain / COMBO_TIER_STEP);
+  const withinTier = chain % COMBO_TIER_STEP;
+  return Math.min(4, 1 + tier * 0.35 + withinTier * 0.08);
+}
+
+function resetCombo() {
+  state.combo.count = 0;
+  state.combo.timer = 0;
+  state.combo.multiplier = 1;
+  state.combo.pulse = 0;
+  state.combo.tier = 0;
+}
+
+function awardKillScore(enemy) {
+  state.combo.count += 1;
+  state.combo.timer = COMBO_RESET_TIME;
+  state.combo.multiplier = getComboMultiplier(state.combo.count);
+  state.combo.tier = getComboTier(state.combo.count);
+  state.combo.pulse = 0.28;
+
+  const baseScore = enemy.kind === "boss"
+    ? 520
+    : Math.round(18 + enemy.xpValue * 2.2);
+  const gained = Math.round(baseScore * state.combo.multiplier);
+  state.score += gained;
+  spawnFloatingText(enemy.x, enemy.y - enemy.radius - 14, `+${gained}`, "#ffbf7b");
+}
+
+function updateCombo(dt) {
+  state.combo.pulse = Math.max(0, state.combo.pulse - dt);
+  if (state.phase !== "playing") {
+    return;
+  }
+  if (state.combo.timer > 0) {
+    state.combo.timer = Math.max(0, state.combo.timer - dt);
+    if (state.combo.timer <= 0) {
+      resetCombo();
+    }
+  }
+}
+
 function resetRunState() {
   state.elapsed = 0;
   state.wave = 1;
   state.kills = 0;
+  state.score = 0;
   state.spawnTimer = 0;
   state.pendingLevelUps = 0;
   state.enemies = [];
@@ -387,7 +500,11 @@ function resetRunState() {
   state.pickups = [];
   state.damageTexts = [];
   state.dashTrailParticles = [];
+  state.laserHitParticles = [];
+  state.chainArcs = [];
+  resetCombo();
   state.player = createPlayer();
+  discoverWeapon("pistol");
   state.boss = null;
   state.bossSpawnedInWave = false;
   state.waveAnnouncementTimer = 2.2;
@@ -397,9 +514,11 @@ function resetRunState() {
 }
 
 function showOverlay(title, text, buttons) {
+  overlayCard.querySelectorAll(".codex-info-panel--floating").forEach((panel) => panel.remove());
   overlayTitle.textContent = title;
   overlayText.textContent = text;
   overlay.classList.remove("hidden");
+  overlayCard.classList.remove("overlay-card--codex");
   upgradeOptions.className = "upgrade-options";
   upgradeOptions.innerHTML = "";
 
@@ -414,7 +533,9 @@ function showOverlay(title, text, buttons) {
 }
 
 function hideOverlay() {
+  overlayCard.querySelectorAll(".codex-info-panel--floating").forEach((panel) => panel.remove());
   overlay.classList.add("hidden");
+  overlayCard.classList.remove("overlay-card--codex");
   upgradeOptions.className = "upgrade-options";
   upgradeOptions.innerHTML = "";
 }
@@ -496,6 +617,7 @@ function showSettingsOverlay(fromPause) {
   slider.addEventListener("input", () => {
     const v = Number(slider.value) / 100;
     state.audio.volume = clamp(v, 0, 1);
+    refreshAudioOutputGain();
     valueSpan.textContent = `${Math.round(state.audio.volume * 100)}%`;
     try {
       localStorage.setItem("zombieRoguelikeVolume", String(state.audio.volume));
@@ -585,7 +707,7 @@ function formatTime(seconds) {
 function computeRunScore() {
   const p = state.player;
   const level = p ? p.level : 1;
-  return Math.floor(state.kills * 18 + state.wave * 220 + state.elapsed * 2.5 + level * 45);
+  return Math.floor(state.score + state.wave * 220 + state.elapsed * 2.5 + level * 45);
 }
 
 function loadLeaderboard() {
@@ -613,6 +735,50 @@ function saveLeaderboard(list) {
   } catch (_) {
     /* ignore quota / private mode */
   }
+}
+
+function loadCodexProgress() {
+  try {
+    const raw = localStorage.getItem(CODEX_PROGRESS_KEY);
+    if (!raw) {
+      return;
+    }
+    const data = JSON.parse(raw);
+    const weapons = Array.isArray(data.weapons) ? data.weapons : [];
+    const enemies = Array.isArray(data.enemies) ? data.enemies : [];
+    state.codex.discoveredWeapons = new Set(weapons.filter((type) => weaponDefinitions[type]));
+    state.codex.discoveredEnemies = new Set(enemies.filter((kind) => ["walker", "runner", "brute", "boss"].includes(kind)));
+  } catch (_) {
+    state.codex.discoveredWeapons = new Set();
+    state.codex.discoveredEnemies = new Set();
+  }
+}
+
+function saveCodexProgress() {
+  try {
+    localStorage.setItem(CODEX_PROGRESS_KEY, JSON.stringify({
+      weapons: [...state.codex.discoveredWeapons],
+      enemies: [...state.codex.discoveredEnemies],
+    }));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function discoverWeapon(type) {
+  if (!weaponDefinitions[type] || state.codex.discoveredWeapons.has(type)) {
+    return;
+  }
+  state.codex.discoveredWeapons.add(type);
+  saveCodexProgress();
+}
+
+function discoverEnemy(kind) {
+  if (!["walker", "runner", "brute", "boss"].includes(kind) || state.codex.discoveredEnemies.has(kind)) {
+    return;
+  }
+  state.codex.discoveredEnemies.add(kind);
+  saveCodexProgress();
 }
 
 function recordLeaderboardEntry() {
@@ -649,7 +815,379 @@ function openMainMenuOverlay() {
       description: t("menu.leaderboard.desc"),
       onClick: showLeaderboardFromMenu,
     },
+    {
+      label: t("menu.codex.label"),
+      description: t("menu.codex.desc"),
+      onClick: showCodexRootFromMenu,
+    },
   ]);
+}
+
+function getBasePlayerForCodex() {
+  return {
+    damageMultiplier: 1,
+    fireRate: 1,
+  };
+}
+
+function formatCodexNumber(value) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(2);
+}
+
+function buildWeaponCodexSummary(type) {
+  const basePlayer = getBasePlayerForCodex();
+  const stats = weaponDefinitions[type].getStats(1, basePlayer);
+
+  if (type === "shotgun") {
+    return t("codex.weaponStats.shotgun", {
+      damage: formatCodexNumber(stats.damage),
+      pellets: stats.pellets,
+      cooldown: formatCodexNumber(stats.cooldown),
+      range: formatCodexNumber(stats.range),
+    });
+  }
+
+  if (type === "laser") {
+    return t("codex.weaponStats.laser", {
+      dps: formatCodexNumber(stats.dps),
+      duration: formatCodexNumber(stats.beamDuration),
+      range: formatCodexNumber(stats.range),
+    });
+  }
+
+  if (type === "plasma") {
+    return t("codex.weaponStats.plasma", {
+      damage: formatCodexNumber(stats.damage),
+      chain: stats.chainTargets,
+      slow: Math.round((1 - stats.slowMultiplier) * 100),
+      range: formatCodexNumber(stats.range),
+    });
+  }
+
+  return t("codex.weaponStats.ballistic", {
+    damage: formatCodexNumber(stats.damage),
+    cooldown: formatCodexNumber(stats.cooldown),
+    range: formatCodexNumber(stats.range),
+  });
+}
+
+function buildEnemyCodexSummary(kind) {
+  const currentWave = state.wave;
+  state.wave = 1;
+  const enemy = createEnemy(kind, 0, 0);
+  state.wave = currentWave;
+  return {
+    name: enemyDisplayName(kind),
+    description: t(`codex.enemy.${kind}.desc`),
+    summary: t("codex.enemyStats", {
+      hp: formatCodexNumber(enemy.maxHp),
+      speed: formatCodexNumber(enemy.speed),
+      damage: formatCodexNumber(enemy.damage),
+      xp: enemy.xpValue,
+    }),
+  };
+}
+
+function getCodexCardVisuals(category, key) {
+  const accent = "#90a4ff";
+  if (category === "enemies") {
+    const map = {
+      walker: { accent, icon: "Z", rarity: "standard" },
+      runner: { accent, icon: ">>", rarity: "standard" },
+      brute: { accent, icon: "B", rarity: "standard" },
+      boss: { accent, icon: "BOSS", rarity: "standard" },
+    };
+    return map[key] || { accent, icon: "?", rarity: "standard" };
+  }
+
+  const map = {
+    pistol: { accent, icon: "P", rarity: "standard" },
+    smg: { accent, icon: "SMG", rarity: "standard" },
+    shotgun: { accent, icon: "SG", rarity: "standard" },
+    rifle: { accent, icon: "AR", rarity: "standard" },
+    laser: { accent, icon: "LZR", rarity: "standard" },
+    plasma: { accent, icon: "PLS", rarity: "standard" },
+  };
+  return map[key] || { accent, icon: "?", rarity: "standard" };
+}
+
+function createCodexCard(entry, category, index) {
+  const visuals = getCodexCardVisuals(category, entry.key);
+  const card = document.createElement("button");
+  card.type = "button";
+  card.className = `codex-card${entry.discovered ? " is-discovered" : " is-locked"}`;
+  card.style.setProperty("--codex-accent", visuals.accent);
+  card.dataset.category = category;
+  card.dataset.rarity = visuals.rarity;
+
+  const displayName = entry.discovered ? entry.name : "";
+  const icon = entry.discovered ? visuals.icon : t("codex.locked.icon");
+
+  card.innerHTML = `
+    <div class="codex-card-top">
+      <span class="codex-card-tag">${category === "weapons" ? t("codex.weapons") : t("codex.enemies")}</span>
+      <span class="codex-card-index">${String(index + 1).padStart(2, "0")}</span>
+    </div>
+    <div class="codex-card-art${entry.discovered ? "" : " codex-card-art--back"}">${icon}</div>
+    ${entry.discovered ? `<strong class="codex-card-name">${displayName}</strong>` : ""}
+  `;
+
+  return card;
+}
+
+function createCodexInfoPanel(entry, category) {
+  const panel = document.createElement("section");
+  panel.className = "codex-info-panel";
+
+  const visuals = getCodexCardVisuals(category, entry.key);
+  const name = entry.discovered ? entry.name : t("codex.locked.name");
+  const desc = entry.discovered ? entry.description : t("codex.locked.desc");
+  const summary = entry.discovered ? entry.summary : t("codex.locked.stats");
+  const badge = entry.discovered ? t("codex.discovered.badge") : t("codex.locked.badge");
+  const categoryLabel = category === "weapons" ? t("codex.weapons") : t("codex.enemies");
+  const icon = entry.discovered ? visuals.icon : t("codex.locked.icon");
+
+  panel.style.setProperty("--codex-accent", visuals.accent);
+
+  panel.innerHTML = `
+    <div class="codex-info-layout">
+      <div class="codex-info-preview${entry.discovered ? "" : " is-locked"}">
+        <div class="codex-info-preview-top">
+          <span class="codex-info-preview-tag">${categoryLabel}</span>
+          <span class="codex-info-index">${String((entry.absoluteIndex ?? 0) + 1).padStart(2, "0")}</span>
+        </div>
+        <div class="codex-info-preview-art${entry.discovered ? "" : " codex-info-preview-art--back"}">${icon}</div>
+        <strong class="codex-info-preview-name">${name}</strong>
+      </div>
+      <div class="codex-info-content">
+        <div class="codex-info-top">
+          <span class="codex-info-badge">${badge}</span>
+        </div>
+        <h4 class="codex-info-title">${name}</h4>
+        <p class="codex-info-desc">${desc}</p>
+        <div class="codex-info-stats">${summary}</div>
+      </div>
+    </div>
+  `;
+
+  return panel;
+}
+
+function createCodexSection(title, entries, category) {
+  const section = document.createElement("section");
+  section.className = "codex-section";
+
+  const heading = document.createElement("h3");
+  heading.className = "codex-section-title";
+  heading.textContent = title;
+  section.appendChild(heading);
+
+  const gridWrap = document.createElement("div");
+  gridWrap.className = "codex-grid-wrap";
+  const grid = document.createElement("div");
+  grid.className = "codex-grid";
+  const infoPanel = document.createElement("section");
+  infoPanel.className = "codex-info-panel codex-info-panel--floating";
+  overlayCard.appendChild(infoPanel);
+
+  const hidePreview = () => {
+    infoPanel.classList.remove("is-visible");
+  };
+
+  const showPreview = (entry, card) => {
+    const nextPanel = createCodexInfoPanel(entry, category);
+    infoPanel.innerHTML = nextPanel.innerHTML;
+    infoPanel.className = "codex-info-panel codex-info-panel--floating is-visible";
+
+    requestAnimationFrame(() => {
+      if (!infoPanel.classList.contains("is-visible")) {
+        return;
+      }
+
+      const gap = 12;
+      const hostRect = overlayCard.getBoundingClientRect();
+      const cardRect = card.getBoundingClientRect();
+      const panelRect = infoPanel.getBoundingClientRect();
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+
+      let left = 0;
+      let top = 0;
+      left = cardRect.left - hostRect.left + ((cardRect.width - panelRect.width) / 2);
+      const minLeft = -hostRect.left + gap;
+      const maxLeft = viewportWidth - hostRect.left - panelRect.width - gap;
+      left = Math.max(minLeft, Math.min(left, maxLeft));
+
+      const preferredTop = cardRect.top - hostRect.top - panelRect.height - gap;
+      const minTop = -hostRect.top + gap;
+      if (preferredTop >= minTop) {
+        top = preferredTop;
+      } else {
+        const fallbackBottom = cardRect.bottom - hostRect.top + gap;
+        const maxTop = viewportHeight - hostRect.top - panelRect.height - gap;
+        top = Math.min(fallbackBottom, maxTop);
+      }
+
+      infoPanel.style.left = `${left}px`;
+      infoPanel.style.top = `${top}px`;
+    });
+  };
+
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i];
+    const card = createCodexCard(entry, entry.category, entry.absoluteIndex ?? i);
+
+    card.addEventListener("mouseenter", () => showPreview(entry, card));
+    card.addEventListener("focus", () => showPreview(entry, card));
+    card.addEventListener("click", () => showPreview(entry, card));
+    card.addEventListener("blur", hidePreview);
+
+    grid.appendChild(card);
+  }
+
+  gridWrap.addEventListener("mouseleave", hidePreview);
+  gridWrap.appendChild(grid);
+  section.appendChild(gridWrap);
+  return section;
+}
+
+function getCodexEntries(category) {
+  if (category === "enemies") {
+    return ["walker", "runner", "brute", "boss"].map((kind, index) => ({
+      key: kind,
+      category,
+      ...buildEnemyCodexSummary(kind),
+      discovered: state.codex.discoveredEnemies.has(kind),
+      absoluteIndex: index,
+    }));
+  }
+
+  return Object.keys(weaponDefinitions).map((type, index) => ({
+    key: type,
+    category,
+    name: weaponName(type),
+    description: weaponUnlockText(type),
+    summary: buildWeaponCodexSummary(type),
+    discovered: state.codex.discoveredWeapons.has(type),
+    absoluteIndex: index,
+  }));
+}
+
+function showCodexRootFromMenu() {
+  state.phase = "menu_codex";
+  overlayCard.querySelectorAll(".codex-info-panel--floating").forEach((panel) => panel.remove());
+  overlayTitle.textContent = t("codex.title");
+  overlayText.textContent = t("codex.hint");
+  overlay.classList.remove("hidden");
+  overlayCard.classList.add("overlay-card--codex");
+  upgradeOptions.className = "upgrade-options upgrade-options--codex-root";
+  upgradeOptions.innerHTML = "";
+
+  const rootGrid = document.createElement("div");
+  rootGrid.className = "codex-root-grid";
+
+  const weaponCard = document.createElement("button");
+  weaponCard.type = "button";
+  weaponCard.className = "codex-root-card";
+  weaponCard.innerHTML = `<strong>${t("codex.weapons")}</strong><span>${t("codex.root.weapons.desc")}</span><small>${t("codex.collected", {
+    count: state.codex.discoveredWeapons.size,
+    total: Object.keys(weaponDefinitions).length,
+  })}</small>`;
+  weaponCard.addEventListener("click", () => showCodexCategoryFromMenu("weapons", 0));
+  rootGrid.appendChild(weaponCard);
+
+  const enemyCard = document.createElement("button");
+  enemyCard.type = "button";
+  enemyCard.className = "codex-root-card";
+  enemyCard.innerHTML = `<strong>${t("codex.enemies")}</strong><span>${t("codex.root.enemies.desc")}</span><small>${t("codex.collected", {
+    count: state.codex.discoveredEnemies.size,
+    total: 4,
+  })}</small>`;
+  enemyCard.addEventListener("click", () => showCodexCategoryFromMenu("enemies", 0));
+  rootGrid.appendChild(enemyCard);
+
+  upgradeOptions.appendChild(rootGrid);
+
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "upgrade-button codex-back-button";
+  backBtn.innerHTML = `<strong>${t("lb.back.label")}</strong><span>${t("lb.back.desc")}</span>`;
+  backBtn.addEventListener("click", openMainMenuOverlay);
+  upgradeOptions.appendChild(backBtn);
+}
+
+function changeCodexPage(delta) {
+  const entries = getCodexEntries(state.codex.category);
+  const totalPages = Math.max(1, Math.ceil(entries.length / state.codex.pageSize));
+  state.codex.page = Math.max(0, Math.min(totalPages - 1, state.codex.page + delta));
+  showCodexCategoryFromMenu(state.codex.category, state.codex.page);
+}
+
+function showCodexCategoryFromMenu(category, page = 0) {
+  state.phase = "menu_codex_category";
+  overlayCard.querySelectorAll(".codex-info-panel--floating").forEach((panel) => panel.remove());
+  state.codex.category = category;
+  state.codex.page = page;
+  overlayTitle.textContent = category === "weapons" ? t("codex.weapons") : t("codex.enemies");
+  overlayText.textContent = t("codex.categoryHint");
+  overlay.classList.remove("hidden");
+  overlayCard.classList.add("overlay-card--codex");
+  upgradeOptions.className = "upgrade-options upgrade-options--codex";
+  upgradeOptions.innerHTML = "";
+
+  const entries = getCodexEntries(category);
+  const discoveredCount = entries.filter((entry) => entry.discovered).length;
+  const totalPages = Math.max(1, Math.ceil(entries.length / state.codex.pageSize));
+  state.codex.page = Math.max(0, Math.min(totalPages - 1, state.codex.page));
+  const pageStart = state.codex.page * state.codex.pageSize;
+  const visibleEntries = entries.slice(pageStart, pageStart + state.codex.pageSize);
+
+  const pageArea = document.createElement("div");
+  pageArea.className = "codex-page-area";
+  pageArea.appendChild(createCodexSection(
+    t("codex.sectionTitle", {
+      name: category === "weapons" ? t("codex.weapons") : t("codex.enemies"),
+      collected: discoveredCount,
+      total: entries.length,
+    }),
+    visibleEntries,
+    category
+  ));
+
+  upgradeOptions.appendChild(pageArea);
+
+  const footer = document.createElement("div");
+  footer.className = "codex-footer";
+
+  const prevBtn = document.createElement("button");
+  prevBtn.type = "button";
+  prevBtn.className = "codex-page-button";
+  prevBtn.textContent = t("codex.prev");
+  prevBtn.disabled = state.codex.page <= 0;
+  prevBtn.addEventListener("click", () => changeCodexPage(-1));
+  footer.appendChild(prevBtn);
+
+  const pageText = document.createElement("div");
+  pageText.className = "codex-page-indicator";
+  pageText.textContent = t("codex.page", { current: state.codex.page + 1, total: totalPages });
+  footer.appendChild(pageText);
+
+  const nextBtn = document.createElement("button");
+  nextBtn.type = "button";
+  nextBtn.className = "codex-page-button";
+  nextBtn.textContent = t("codex.next");
+  nextBtn.disabled = state.codex.page >= totalPages - 1;
+  nextBtn.addEventListener("click", () => changeCodexPage(1));
+  footer.appendChild(nextBtn);
+
+  upgradeOptions.appendChild(footer);
+
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "upgrade-button codex-back-button";
+  backBtn.innerHTML = `<strong>${t("codex.backToRoot.label")}</strong><span>${t("codex.backToRoot.desc")}</span>`;
+  backBtn.addEventListener("click", showCodexRootFromMenu);
+  upgradeOptions.appendChild(backBtn);
 }
 
 function showLeaderboardFromMenu() {
@@ -712,9 +1250,26 @@ function updateHud() {
   levelText.textContent = `${player.level}`;
   xpText.textContent = `${Math.floor(player.xp)} / ${player.xpToNext}`;
   killsText.textContent = `${state.kills}`;
+  scoreText.textContent = `${computeRunScore()}`;
   timeText.textContent = formatTime(state.elapsed);
   waveText.textContent = `${state.wave}${isBossWave(state.wave) ? ` ${t("hud.waveBoss")}` : ""}`;
   weaponText.textContent = getWeaponSummary();
+
+  const comboActive = state.combo.count > 1 && state.combo.timer > 0;
+  comboHud.classList.toggle("hidden", !comboActive);
+  if (comboActive) {
+    comboHud.dataset.tier = String(Math.min(5, state.combo.tier));
+    comboHud.classList.toggle("is-active", state.combo.pulse > 0);
+    comboText.textContent = `${state.combo.count}`;
+    comboMultText.textContent = `x${state.combo.multiplier.toFixed(2)}`;
+    comboFlame.dataset.tier = String(Math.min(5, state.combo.tier));
+  } else {
+    comboHud.dataset.tier = "0";
+    comboHud.classList.remove("is-active");
+    comboText.textContent = "0";
+    comboMultText.textContent = "x1.00";
+    comboFlame.dataset.tier = "0";
+  }
 }
 
 function updateBossBar() {
@@ -741,11 +1296,109 @@ function ensureAudio() {
 
   if (!state.audio.context) {
     state.audio.context = new AudioContextClass();
+    state.audio.outputGainNode = state.audio.context.createGain();
+    state.audio.outputGainNode.connect(state.audio.context.destination);
   }
 
   if (state.audio.context.state === "suspended") {
     state.audio.context.resume();
   }
+
+  refreshAudioOutputGain();
+}
+
+function refreshAudioOutputGain() {
+  if (!state.audio.outputGainNode || !state.audio.context) {
+    return;
+  }
+
+  state.audio.outputGainNode.gain.setValueAtTime(
+    state.audio.volume * state.audio.outputBoost,
+    state.audio.context.currentTime
+  );
+}
+
+function playDashSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(state.audio.outputGainNode || context.destination);
+
+  master.gain.setValueAtTime(0.13, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.2);
+
+  const low = context.createOscillator();
+  const lowGain = context.createGain();
+  low.type = "sawtooth";
+  low.frequency.setValueAtTime(180, start);
+  low.frequency.exponentialRampToValueAtTime(620, start + 0.12);
+  lowGain.gain.setValueAtTime(1, start);
+  lowGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.16);
+  low.connect(lowGain);
+  lowGain.connect(master);
+
+  const high = context.createOscillator();
+  const highGain = context.createGain();
+  high.type = "triangle";
+  high.frequency.setValueAtTime(520, start);
+  high.frequency.exponentialRampToValueAtTime(980, start + 0.08);
+  highGain.gain.setValueAtTime(0.65, start);
+  highGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.11);
+  high.connect(highGain);
+  highGain.connect(master);
+
+  low.start(start);
+  high.start(start);
+  low.stop(start + 0.2);
+  high.stop(start + 0.14);
+}
+
+function playPlasmaHitSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(state.audio.outputGainNode || context.destination);
+  master.gain.setValueAtTime(0.085, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.16);
+
+  const zap = context.createOscillator();
+  const zapGain = context.createGain();
+  const zapFilter = context.createBiquadFilter();
+  zap.type = "sawtooth";
+  zap.frequency.setValueAtTime(980, start);
+  zap.frequency.exponentialRampToValueAtTime(360, start + 0.07);
+  zapFilter.type = "highpass";
+  zapFilter.frequency.setValueAtTime(420, start);
+  zapGain.gain.setValueAtTime(0.9, start);
+  zapGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.08);
+  zap.connect(zapFilter);
+  zapFilter.connect(zapGain);
+  zapGain.connect(master);
+
+  const crack = context.createOscillator();
+  const crackGain = context.createGain();
+  crack.type = "square";
+  crack.frequency.setValueAtTime(640, start);
+  crack.frequency.exponentialRampToValueAtTime(1320, start + 0.04);
+  crackGain.gain.setValueAtTime(0.42, start);
+  crackGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.05);
+  crack.connect(crackGain);
+  crackGain.connect(master);
+
+  const thump = context.createOscillator();
+  const thumpGain = context.createGain();
+  thump.type = "triangle";
+  thump.frequency.setValueAtTime(180, start);
+  thump.frequency.exponentialRampToValueAtTime(92, start + 0.11);
+  thumpGain.gain.setValueAtTime(0.28, start);
+  thumpGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.13);
+  thump.connect(thumpGain);
+  thumpGain.connect(master);
+
+  zap.start(start);
+  crack.start(start + 0.004);
+  thump.start(start);
+  zap.stop(start + 0.09);
+  crack.stop(start + 0.06);
+  thump.stop(start + 0.14);
 }
 
 function playSound(kind) {
@@ -761,6 +1414,9 @@ function playSound(kind) {
   if (kind === "hit" && now - state.audio.lastHitAt < 45) {
     return;
   }
+  if (kind === "plasmaHit" && now - state.audio.lastPlasmaHitAt < 55) {
+    return;
+  }
 
   if (kind === "shoot") {
     state.audio.lastShootAt = now;
@@ -768,11 +1424,23 @@ function playSound(kind) {
   if (kind === "hit") {
     state.audio.lastHitAt = now;
   }
+  if (kind === "plasmaHit") {
+    state.audio.lastPlasmaHitAt = now;
+  }
+
+  if (kind === "dash") {
+    playDashSound(context);
+    return;
+  }
+  if (kind === "plasmaHit") {
+    playPlasmaHitSound(context);
+    return;
+  }
 
   const oscillator = context.createOscillator();
   const gainNode = context.createGain();
   oscillator.connect(gainNode);
-  gainNode.connect(context.destination);
+  gainNode.connect(state.audio.outputGainNode || context.destination);
 
   let frequency = 220;
   let endFrequency = frequency;
@@ -783,60 +1451,58 @@ function playSound(kind) {
   if (kind === "shoot") {
     frequency = 340;
     endFrequency = 220;
-    volume = 0.03;
-    duration = 0.06;
+    volume = 0.05;
+    duration = 0.07;
     type = "square";
   } else if (kind === "hit") {
     frequency = 180;
     endFrequency = 120;
-    volume = 0.025;
-    duration = 0.05;
+    volume = 0.035;
+    duration = 0.06;
     type = "triangle";
   } else if (kind === "pickup") {
     frequency = 560;
     endFrequency = 780;
-    volume = 0.04;
+    volume = 0.055;
     duration = 0.1;
     type = "triangle";
   } else if (kind === "levelup") {
     frequency = 420;
     endFrequency = 820;
-    volume = 0.05;
+    volume = 0.065;
     duration = 0.18;
     type = "triangle";
   } else if (kind === "boss") {
     frequency = 150;
     endFrequency = 70;
-    volume = 0.06;
+    volume = 0.085;
     duration = 0.35;
     type = "sawtooth";
   } else if (kind === "start") {
     frequency = 300;
     endFrequency = 480;
-    volume = 0.05;
+    volume = 0.06;
     duration = 0.14;
     type = "triangle";
   } else if (kind === "gameover") {
     frequency = 280;
     endFrequency = 90;
-    volume = 0.05;
+    volume = 0.07;
     duration = 0.35;
     type = "sawtooth";
   } else if (kind === "laser") {
     frequency = 480;
     endFrequency = 320;
-    volume = 0.018;
-    duration = 0.05;
+    volume = 0.03;
+    duration = 0.06;
     type = "sine";
-  } else if (kind === "dash") {
-    frequency = 380;
-    endFrequency = 620;
-    volume = 0.022;
-    duration = 0.07;
+  } else if (kind === "plasma") {
+    frequency = 250;
+    endFrequency = 520;
+    volume = 0.045;
+    duration = 0.11;
     type = "triangle";
   }
-
-  volume *= state.audio.volume;
 
   oscillator.type = type;
   oscillator.frequency.setValueAtTime(frequency, context.currentTime);
@@ -866,10 +1532,13 @@ function clamp(value, min, max) {
         state.audio.volume = clamp(n, 0, 1);
       }
     }
+
   } catch (_) {
     /* ignore */
   }
 })();
+
+loadCodexProgress();
 
 function normalizeVector(x, y) {
   const length = Math.hypot(x, y);
@@ -935,6 +1604,13 @@ function spawnProjectile(config) {
     color: config.color,
     life: config.life,
     pierce: config.pierce,
+    kind: config.kind || "ballistic",
+    chainRange: config.chainRange || 0,
+    chainTargets: config.chainTargets || 0,
+    chainDamageFactor: config.chainDamageFactor || 0,
+    chainDecay: config.chainDecay || 1,
+    slowMultiplier: config.slowMultiplier || 1,
+    slowDuration: config.slowDuration || 0,
     hitIds: new Set(),
   });
 }
@@ -993,6 +1669,8 @@ function applyLaserBeamDamage(weapon, stats, dt) {
     }
     hitAny = true;
     enemy.hp -= dmg;
+    enemy.laserFlash = 0.08;
+    spawnLaserHitParticles(enemy, stats, weapon.laserAngle);
     if (enemy.hp <= 0) {
       handleEnemyDeath(enemy, j);
     } else if (enemy.kind === "boss") {
@@ -1066,10 +1744,17 @@ function fireWeapon(weapon, stats, target) {
       color: stats.color,
       life: stats.range / stats.speed,
       pierce: stats.pierce,
+      kind: weapon.type,
+      chainRange: stats.chainRange,
+      chainTargets: stats.chainTargets,
+      chainDamageFactor: stats.chainDamageFactor,
+      chainDecay: stats.chainDecay,
+      slowMultiplier: stats.slowMultiplier,
+      slowDuration: stats.slowDuration,
     });
   }
 
-  playSound("shoot");
+  playSound(weapon.type === "plasma" ? "plasma" : "shoot");
 }
 
 function spawnDashTrailParticles(player, dt) {
@@ -1094,6 +1779,31 @@ function spawnDashTrailParticles(player, dt) {
   }
 }
 
+function spawnLaserHitParticles(enemy, stats, beamAngle) {
+  const n = enemy.kind === "boss" ? 5 : 3;
+  const dirX = Math.cos(beamAngle);
+  const dirY = Math.sin(beamAngle);
+  const perpX = -dirY;
+  const perpY = dirX;
+
+  for (let i = 0; i < n; i += 1) {
+    const spread = randomRange(-1, 1);
+    const forward = randomRange(14, 60);
+    const side = randomRange(-14, 14);
+    const life = randomRange(0.08, 0.16);
+    state.laserHitParticles.push({
+      x: enemy.x + perpX * side,
+      y: enemy.y + perpY * side,
+      vx: dirX * forward + perpX * spread * 80,
+      vy: dirY * forward + perpY * spread * 80,
+      life,
+      maxLife: life,
+      r: randomRange(1.8, 3.8),
+      color: stats.color,
+    });
+  }
+}
+
 function updateDashTrailParticles(dt) {
   for (let i = state.dashTrailParticles.length - 1; i >= 0; i -= 1) {
     const p = state.dashTrailParticles[i];
@@ -1108,6 +1818,126 @@ function updateDashTrailParticles(dt) {
   }
 }
 
+function updateLaserHitParticles(dt) {
+  for (let i = state.laserHitParticles.length - 1; i >= 0; i -= 1) {
+    const p = state.laserHitParticles[i];
+    p.life -= dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= Math.pow(0.82, dt * 60);
+    p.vy *= Math.pow(0.82, dt * 60);
+    if (p.life <= 0) {
+      state.laserHitParticles.splice(i, 1);
+    }
+  }
+}
+
+function updateChainArcs(dt) {
+  for (let i = state.chainArcs.length - 1; i >= 0; i -= 1) {
+    const arc = state.chainArcs[i];
+    arc.life -= dt;
+    if (arc.life <= 0) {
+      state.chainArcs.splice(i, 1);
+    }
+  }
+}
+
+function applySlowToEnemy(enemy, slowMultiplier, slowDuration) {
+  if (slowDuration <= 0) {
+    return;
+  }
+  enemy.slowTimer = Math.max(enemy.slowTimer || 0, slowDuration);
+  enemy.slowMultiplier = Math.min(enemy.slowMultiplier || 1, slowMultiplier);
+  enemy.shockFlash = Math.max(enemy.shockFlash || 0, 0.14);
+}
+
+function spawnChainArc(x1, y1, x2, y2, color) {
+  state.chainArcs.push({
+    x1,
+    y1,
+    x2,
+    y2,
+    color,
+    life: 0.12,
+    maxLife: 0.12,
+  });
+}
+
+function scoreChainTarget(originX, originY, candidate, visitedIds, chainRange) {
+  const dist = Math.hypot(candidate.x - originX, candidate.y - originY);
+  if (dist > chainRange) {
+    return -Infinity;
+  }
+
+  const clusterRadius = Math.min(118, chainRange * 0.85);
+  let densityScore = 0;
+  for (const other of state.enemies) {
+    if (other.id === candidate.id || visitedIds.has(other.id)) {
+      continue;
+    }
+    const neighborDist = Math.hypot(other.x - candidate.x, other.y - candidate.y);
+    if (neighborDist <= clusterRadius) {
+      densityScore += 1 - (neighborDist / clusterRadius);
+    }
+  }
+
+  const bossBonus = candidate.kind === "boss" ? 0.2 : 0;
+  return densityScore * 100 - dist + bossBonus * 100;
+}
+
+function applyChainDamage(sourceX, sourceY, projectile, initialTargetId) {
+  if (projectile.chainTargets <= 0) {
+    return;
+  }
+
+  const visitedIds = new Set(projectile.hitIds);
+  visitedIds.add(initialTargetId);
+  let originX = sourceX;
+  let originY = sourceY;
+  let damage = projectile.damage * projectile.chainDamageFactor;
+
+  for (let bounce = 0; bounce < projectile.chainTargets; bounce += 1) {
+    let nextEnemy = null;
+    let nextIndex = -1;
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < state.enemies.length; i += 1) {
+      const enemy = state.enemies[i];
+      if (visitedIds.has(enemy.id)) {
+        continue;
+      }
+      const score = scoreChainTarget(originX, originY, enemy, visitedIds, projectile.chainRange);
+      if (score > bestScore) {
+        bestScore = score;
+        nextEnemy = enemy;
+        nextIndex = i;
+      }
+    }
+
+    if (!nextEnemy) {
+      break;
+    }
+
+    visitedIds.add(nextEnemy.id);
+    projectile.hitIds.add(nextEnemy.id);
+    spawnChainArc(originX, originY, nextEnemy.x, nextEnemy.y, projectile.color);
+    nextEnemy.hp -= damage;
+    applySlowToEnemy(nextEnemy, projectile.slowMultiplier, projectile.slowDuration);
+    spawnFloatingText(nextEnemy.x, nextEnemy.y - nextEnemy.radius, `-${Math.round(damage)}`, "#9cf7ff");
+    playSound("plasmaHit");
+
+    if (nextEnemy.hp <= 0) {
+      handleEnemyDeath(nextEnemy, nextIndex);
+    } else if (nextEnemy.kind === "boss") {
+      updateBossBar();
+    }
+
+    originX = nextEnemy.x;
+    originY = nextEnemy.y;
+    damage *= projectile.chainDecay;
+  }
+}
+
 function drawDashTrailParticles(cameraX, cameraY) {
   for (const p of state.dashTrailParticles) {
     const t = p.life / p.maxLife;
@@ -1119,6 +1949,41 @@ function drawDashTrailParticles(cameraX, cameraY) {
     ctx.arc(sx, sy, p.r * (0.65 + 0.35 * t), 0, TAU);
     ctx.fill();
   }
+}
+
+function drawLaserHitParticles(cameraX, cameraY) {
+  for (const p of state.laserHitParticles) {
+    const t = p.life / p.maxLife;
+    const alpha = 0.2 + t * 0.8;
+    const sx = p.x - cameraX + canvas.width / 2;
+    const sy = p.y - cameraY + canvas.height / 2;
+    ctx.fillStyle = hexToRgba(p.color, alpha);
+    ctx.beginPath();
+    ctx.arc(sx, sy, p.r * (0.7 + 0.4 * t), 0, TAU);
+    ctx.fill();
+  }
+}
+
+function drawChainArcs(cameraX, cameraY) {
+  ctx.save();
+  ctx.lineCap = "round";
+  for (const arc of state.chainArcs) {
+    const alpha = arc.life / arc.maxLife;
+    ctx.strokeStyle = hexToRgba(arc.color, 0.18 + alpha * 0.72);
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(arc.x1 - cameraX + canvas.width / 2, arc.y1 - cameraY + canvas.height / 2);
+    ctx.lineTo(arc.x2 - cameraX + canvas.width / 2, arc.y2 - cameraY + canvas.height / 2);
+    ctx.stroke();
+
+    ctx.strokeStyle = `rgba(235, 255, 255, ${0.16 + alpha * 0.64})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(arc.x1 - cameraX + canvas.width / 2, arc.y1 - cameraY + canvas.height / 2);
+    ctx.lineTo(arc.x2 - cameraX + canvas.width / 2, arc.y2 - cameraY + canvas.height / 2);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function tryStartDash() {
@@ -1218,6 +2083,10 @@ function createEnemy(kind, x, y) {
       damage: 8 + state.wave * 0.4,
       xpValue: 10,
       tint: "#8ef7c5",
+      laserFlash: 0,
+      shockFlash: 0,
+      slowTimer: 0,
+      slowMultiplier: 1,
       touchDamageCooldown: 0,
       summonTimer: 0,
     };
@@ -1237,6 +2106,10 @@ function createEnemy(kind, x, y) {
       damage: 18 + state.wave * 0.7,
       xpValue: 18,
       tint: "#ffb067",
+      laserFlash: 0,
+      shockFlash: 0,
+      slowTimer: 0,
+      slowMultiplier: 1,
       touchDamageCooldown: 0,
       summonTimer: 0,
     };
@@ -1256,6 +2129,10 @@ function createEnemy(kind, x, y) {
       damage: 24 + state.wave,
       xpValue: 120 + state.wave * 30,
       tint: "#ff5d70",
+      laserFlash: 0,
+      shockFlash: 0,
+      slowTimer: 0,
+      slowMultiplier: 1,
       touchDamageCooldown: 0,
       summonTimer: 4.8,
     };
@@ -1274,6 +2151,10 @@ function createEnemy(kind, x, y) {
     damage: 10 + state.wave * 0.5,
     xpValue: 8,
     tint: "#9bf25a",
+    laserFlash: 0,
+    shockFlash: 0,
+    slowTimer: 0,
+    slowMultiplier: 1,
     touchDamageCooldown: 0,
     summonTimer: 0,
   };
@@ -1326,11 +2207,13 @@ function pickEnemyTypeForWave() {
 
 function spawnEnemy(kind = pickEnemyTypeForWave()) {
   const spawn = getSpawnPositionAtViewportEdge();
+  discoverEnemy(kind);
   state.enemies.push(createEnemy(kind, spawn.x, spawn.y));
 }
 
 function spawnBoss() {
   const spawn = getSpawnPositionAtViewportEdge(state.player.x, state.player.y, 64, 140);
+  discoverEnemy("boss");
   const boss = createEnemy("boss", spawn.x, spawn.y);
   state.enemies.push(boss);
   state.boss = boss;
@@ -1392,6 +2275,7 @@ function spawnPickup(type, x, y, value = 0) {
 
 function handleEnemyDeath(enemy, index) {
   state.kills += 1;
+  awardKillScore(enemy);
   spawnPickup("xp", enemy.x, enemy.y, enemy.xpValue);
 
   if (enemy.kind === "boss") {
@@ -1436,8 +2320,16 @@ function updateProjectiles(dt) {
 
       projectile.hitIds.add(enemy.id);
       enemy.hp -= projectile.damage;
+      if (projectile.kind === "plasma") {
+        applySlowToEnemy(enemy, projectile.slowMultiplier, projectile.slowDuration);
+        spawnChainArc(projectile.x, projectile.y, enemy.x, enemy.y, projectile.color);
+      }
       spawnFloatingText(enemy.x, enemy.y - enemy.radius, `-${Math.round(projectile.damage)}`, "#fff1a1");
-      playSound("hit");
+      playSound(projectile.kind === "plasma" ? "plasmaHit" : "hit");
+
+      if (projectile.kind === "plasma") {
+        applyChainDamage(enemy.x, enemy.y, projectile, enemy.id);
+      }
 
       if (enemy.hp <= 0) {
         handleEnemyDeath(enemy, j);
@@ -1467,18 +2359,27 @@ function updateEnemies(dt) {
     const dx = player.x - enemy.x;
     const dy = player.y - enemy.y;
     const angle = Math.atan2(dy, dx);
+    enemy.slowTimer = Math.max(0, (enemy.slowTimer || 0) - dt);
+    if (enemy.slowTimer <= 0) {
+      enemy.slowMultiplier = 1;
+    }
+    const moveScale = enemy.slowTimer > 0 ? enemy.slowMultiplier : 1;
 
-    enemy.x += Math.cos(angle) * enemy.speed * dt;
-    enemy.y += Math.sin(angle) * enemy.speed * dt;
+    enemy.x += Math.cos(angle) * enemy.speed * moveScale * dt;
+    enemy.y += Math.sin(angle) * enemy.speed * moveScale * dt;
     enemy.touchDamageCooldown = Math.max(0, enemy.touchDamageCooldown - dt);
+    enemy.laserFlash = Math.max(0, (enemy.laserFlash || 0) - dt);
+    enemy.shockFlash = Math.max(0, (enemy.shockFlash || 0) - dt);
 
     if (enemy.kind === "boss") {
       enemy.summonTimer -= dt;
       if (enemy.summonTimer <= 0) {
         enemy.summonTimer = Math.max(2.6, 4.8 - state.wave * 0.1);
         for (let n = 0; n < 4; n += 1) {
+          const kind = n % 2 === 0 ? "walker" : "runner";
           const spawn = getSpawnPositionNear(enemy.x, enemy.y, 34, 82);
-          state.enemies.push(createEnemy(n % 2 === 0 ? "walker" : "runner", spawn.x, spawn.y));
+          discoverEnemy(kind);
+          state.enemies.push(createEnemy(kind, spawn.x, spawn.y));
         }
         message.textContent = t("msg.bossSummon", { name: enemy.name });
       }
@@ -1571,6 +2472,7 @@ function grantBossLoot() {
   if (locked.length > 0) {
     const weaponType = locked[Math.floor(Math.random() * locked.length)];
     player.weapons.push(createWeapon(weaponType));
+    discoverWeapon(weaponType);
     message.textContent = t("msg.bossLootUnlock", { weapon: weaponName(weaponType) });
     spawnFloatingText(player.x, player.y - 26, t("float.unlock", { w: weaponName(weaponType) }), "#ffd98e");
   } else {
@@ -1699,6 +2601,7 @@ function buildUpgradeChoices() {
         description: weaponUnlockText(weaponType),
         apply() {
           state.player.weapons.push(createWeapon(weaponType));
+          discoverWeapon(weaponType);
         },
       });
       continue;
@@ -1813,7 +2716,10 @@ function update(dt) {
   updateEnemies(dt);
   updatePickups(dt);
   updateFloatingTexts(dt);
+  updateCombo(dt);
   updateDashTrailParticles(dt);
+  updateLaserHitParticles(dt);
+  updateChainArcs(dt);
 
   const laserLockFacing = state.player.weapons.some(
     (w) => w.type === "laser" && w.beamTimeLeft > 0
@@ -1898,15 +2804,26 @@ function drawPickups(cameraX, cameraY) {
 
 function drawProjectiles(cameraX, cameraY) {
   for (const projectile of state.projectiles) {
+    const sx = projectile.x - cameraX + canvas.width / 2;
+    const sy = projectile.y - cameraY + canvas.height / 2;
+    if (projectile.kind === "plasma") {
+      ctx.save();
+      ctx.shadowBlur = 14;
+      ctx.shadowColor = hexToRgba(projectile.color, 0.65);
+      ctx.fillStyle = projectile.color;
+      ctx.beginPath();
+      ctx.arc(sx, sy, projectile.radius, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = "rgba(235, 255, 255, 0.9)";
+      ctx.beginPath();
+      ctx.arc(sx, sy, Math.max(2, projectile.radius * 0.45), 0, TAU);
+      ctx.fill();
+      ctx.restore();
+      continue;
+    }
     ctx.fillStyle = projectile.color;
     ctx.beginPath();
-    ctx.arc(
-      projectile.x - cameraX + canvas.width / 2,
-      projectile.y - cameraY + canvas.height / 2,
-      projectile.radius,
-      0,
-      TAU
-    );
+    ctx.arc(sx, sy, projectile.radius, 0, TAU);
     ctx.fill();
   }
 }
@@ -1924,6 +2841,49 @@ function drawEnemies(cameraX, cameraY) {
     ctx.beginPath();
     ctx.arc(x, y, enemy.radius, 0, TAU);
     ctx.fill();
+
+    if ((enemy.laserFlash || 0) > 0) {
+      const alpha = Math.min(0.85, enemy.laserFlash / 0.08);
+      ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius * 0.92, 0, TAU);
+      ctx.fill();
+    }
+
+    if ((enemy.shockFlash || 0) > 0) {
+      const alpha = Math.min(0.7, enemy.shockFlash / 0.14);
+      ctx.strokeStyle = `rgba(142, 246, 255, ${alpha})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius + 3, 0, TAU);
+      ctx.stroke();
+    }
+
+    if ((enemy.slowTimer || 0) > 0) {
+      const slowAlpha = Math.min(0.34, enemy.slowTimer * 0.14);
+      ctx.fillStyle = `rgba(120, 225, 255, ${slowAlpha * 0.22})`;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius + 6, 0, TAU);
+      ctx.fill();
+
+      ctx.strokeStyle = `rgba(144, 232, 255, ${slowAlpha})`;
+      ctx.lineWidth = 2;
+      for (let spark = 0; spark < 3; spark += 1) {
+        const base = state.elapsed * 5.2 + enemy.id * 0.9 + spark * 2.1;
+        const r = enemy.radius + 5;
+        const ax = x + Math.cos(base) * r;
+        const ay = y + Math.sin(base) * r;
+        const bx = x + Math.cos(base + 0.22) * (r + 4);
+        const by = y + Math.sin(base + 0.22) * (r + 4);
+        const cx = x + Math.cos(base + 0.44) * r;
+        const cy = y + Math.sin(base + 0.44) * r;
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.lineTo(cx, cy);
+        ctx.stroke();
+      }
+    }
 
     if (enemy.kind === "boss") {
       ctx.strokeStyle = "#ffd6dd";
@@ -2097,8 +3057,10 @@ function draw() {
   drawWeaponHints();
   drawPickups(cameraX, cameraY);
   drawProjectiles(cameraX, cameraY);
+  drawChainArcs(cameraX, cameraY);
   drawEnemies(cameraX, cameraY);
   drawDashTrailParticles(cameraX, cameraY);
+  drawLaserHitParticles(cameraX, cameraY);
   drawLaserBeams();
   drawPlayer();
   drawFloatingTexts(cameraX, cameraY);

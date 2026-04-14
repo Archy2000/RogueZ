@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RogueZ · 僵鸽</title>
+  <title>被解救的僵鸽</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div class="game-shell">
     <header class="topbar">
       <div>
-        <h1 class="game-title"><span class="game-title-en">RogueZ</span><span class="game-title-sep">·</span><span id="gameTitleSuffix" class="game-title-cn">僵鸽</span></h1>
+        <h1 class="game-title"><span class="game-title-en">RogueZ</span><span class="game-title-sep">·</span><span id="gameTitleSuffix" class="game-title-cn">被解救的僵鸽</span></h1>
         <p id="pageSubtitle">俯视角生存肉鸽，自动锁敌射击，撑过尸潮并击败 BOSS。</p>
       </div>
     </header>
@@ -23,9 +23,17 @@
         <div><span id="hudLblLevel"></span> <span id="levelText">1</span></div>
         <div><span id="hudLblXp"></span> <span id="xpText">0 / 0</span></div>
         <div><span id="hudLblKills"></span> <span id="killsText">0</span></div>
+        <div><span id="hudLblScore"></span> <span id="scoreText">0</span></div>
         <div><span id="hudLblTime"></span> <span id="timeText">00:00</span></div>
         <div><span id="hudLblWave"></span> <span id="waveText">1</span></div>
         <div><span id="hudLblWeapons"></span> <span id="weaponText">—</span></div>
+        <div id="comboHud" class="combo-hud hidden" data-tier="0">
+          <div id="comboFlame" class="combo-flame"></div>
+          <div class="combo-copy">
+            <div><span id="hudLblCombo"></span> <span id="comboText">0</span></div>
+            <div id="comboMultText" class="combo-multiplier">x1.00</div>
+          </div>
+        </div>
       </div>
 
       <div id="message" class="message">清理尸潮，尽可能活得更久。</div>

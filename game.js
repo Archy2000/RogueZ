@@ -66,6 +66,9 @@ const COMBO_TIER_STEP = 3;
 const LEADERBOARD_KEY = "rogueZLeaderboardV1";
 const LEADERBOARD_MAX = 5;
 const CODEX_PROGRESS_KEY = "rogueZCodexV1";
+const META_PROGRESS_KEY = "rogueZMetaV1";
+const COIN_CONVERSION_RATIO = 10;
+const WHEEL_SPIN_COST = 80;
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 
 let currentLocale = "zh-CN";
@@ -227,6 +230,12 @@ function applyLanguageToOpenOverlay() {
     case "menu_codex_category":
       showCodexCategoryFromMenu(state.codex.category);
       break;
+    case "menu_shop":
+      showShopFromMenu();
+      break;
+    case "menu_wheel":
+      showWheelFromMenu();
+      break;
     case "paused":
       showPauseMenu();
       break;
@@ -347,6 +356,313 @@ const weaponDefinitions = {
   },
 };
 
+const petDefinitions = {
+  scoutDroid: {
+    key: "scoutDroid",
+    price: 420,
+    origin: "shop",
+    color: "#9ce2ff",
+    rarity: "common",
+    getStats() {
+      return { damage: 14, cooldown: 1.1, range: 340, speed: 540, radius: 4 };
+    },
+    initRuntime(pet) {
+      pet.fireTimer = 0.6;
+    },
+    updateInRun(pet, dt) {
+      const stats = this.getStats();
+      pet.fireTimer -= dt;
+      if (pet.fireTimer <= 0) {
+        const target = getNearestEnemyInRange(stats.range);
+        if (target) {
+          const angle = Math.atan2(target.y - pet.y, target.x - pet.x);
+          spawnProjectile({
+            x: pet.x,
+            y: pet.y,
+            vx: Math.cos(angle) * stats.speed,
+            vy: Math.sin(angle) * stats.speed,
+            radius: stats.radius,
+            damage: stats.damage,
+            color: this.color,
+            life: stats.range / stats.speed,
+            pierce: 0,
+          });
+          pet.fireTimer = stats.cooldown;
+        } else {
+          pet.fireTimer = 0.25;
+        }
+      }
+    },
+    drawInRun(pet, cameraX, cameraY) {
+      const sx = pet.x - cameraX + canvas.width / 2;
+      const sy = pet.y - cameraY + canvas.height / 2;
+      ctx.save();
+      ctx.fillStyle = hexToRgba(this.color, 0.85);
+      ctx.strokeStyle = "#1a2a40";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(sx, sy, 9, 0, TAU);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#0b1a2a";
+      ctx.beginPath();
+      ctx.arc(sx, sy, 3, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+    },
+  },
+  magnetCore: {
+    key: "magnetCore",
+    price: 320,
+    origin: "shop",
+    color: "#ffd86b",
+    rarity: "common",
+    getStats() {
+      return { magnetBonus: 80, pulseInterval: 3, pulseRange: 320 };
+    },
+    applyPassive(player) {
+      player.magnetRange += this.getStats().magnetBonus;
+    },
+    initRuntime(pet) {
+      pet.pulseTimer = this.getStats().pulseInterval;
+    },
+    updateInRun(pet, dt) {
+      const stats = this.getStats();
+      pet.pulseTimer -= dt;
+      if (pet.pulseTimer <= 0) {
+        pet.pulseTimer = stats.pulseInterval;
+        for (const orb of state.pickups) {
+          if (orb.type !== "xp") continue;
+          const d = Math.hypot(orb.x - pet.x, orb.y - pet.y);
+          if (d <= stats.pulseRange) {
+            orb.magnetized = true;
+          }
+        }
+        pet.pulseAnim = 0.5;
+      }
+      pet.pulseAnim = Math.max(0, (pet.pulseAnim || 0) - dt);
+    },
+    drawInRun(pet, cameraX, cameraY) {
+      const sx = pet.x - cameraX + canvas.width / 2;
+      const sy = pet.y - cameraY + canvas.height / 2;
+      ctx.save();
+      const pulse = pet.pulseAnim || 0;
+      if (pulse > 0) {
+        ctx.strokeStyle = hexToRgba(this.color, pulse * 1.4);
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(sx, sy, 14 + (0.5 - pulse) * 60, 0, TAU);
+        ctx.stroke();
+      }
+      ctx.fillStyle = this.color;
+      ctx.strokeStyle = "#3b2a10";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(sx, sy, 8, 0, TAU);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#3b2a10";
+      ctx.fillRect(sx - 5, sy - 1, 10, 2);
+      ctx.restore();
+    },
+  },
+  medicBee: {
+    key: "medicBee",
+    price: 540,
+    origin: "shop",
+    color: "#a5ffb1",
+    rarity: "common",
+    getStats() {
+      return { healAmount: 4, interval: 4 };
+    },
+    initRuntime(pet) {
+      pet.healTimer = this.getStats().interval;
+    },
+    updateInRun(pet, dt) {
+      const stats = this.getStats();
+      pet.healTimer -= dt;
+      if (pet.healTimer <= 0) {
+        pet.healTimer = stats.interval;
+        const p = state.player;
+        if (p && p.hp < p.maxHp) {
+          p.hp = Math.min(p.maxHp, p.hp + stats.healAmount);
+          spawnFloatingText(p.x, p.y - 30, `+${stats.healAmount}`, this.color);
+        }
+      }
+    },
+    drawInRun(pet, cameraX, cameraY) {
+      const sx = pet.x - cameraX + canvas.width / 2;
+      const sy = pet.y - cameraY + canvas.height / 2;
+      ctx.save();
+      ctx.fillStyle = "#2a2a0e";
+      ctx.strokeStyle = this.color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(sx, sy, 9, 7, 0, 0, TAU);
+      ctx.fill();
+      ctx.stroke();
+      const wing = 0.5 + 0.5 * Math.sin(state.elapsed * 24);
+      ctx.fillStyle = hexToRgba(this.color, 0.6);
+      ctx.beginPath();
+      ctx.ellipse(sx - 3, sy - 6 * wing, 5, 3, 0, 0, TAU);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.ellipse(sx + 3, sy - 6 * wing, 5, 3, 0, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+    },
+  },
+  thunderPup: {
+    key: "thunderPup",
+    price: 900,
+    origin: "wheel",
+    color: "#b4a4ff",
+    rarity: "rare",
+    getStats() {
+      return {
+        damage: 18,
+        interval: 2.5,
+        range: 260,
+        chainTargets: 2,
+        chainRange: 140,
+        chainDamageFactor: 0.8,
+        chainDecay: 0.8,
+        slowMultiplier: 0.7,
+        slowDuration: 0.9,
+      };
+    },
+    initRuntime(pet) {
+      pet.zapTimer = 1.2;
+    },
+    updateInRun(pet, dt) {
+      const stats = this.getStats();
+      pet.zapTimer -= dt;
+      if (pet.zapTimer > 0) return;
+      let best = null;
+      let bestDist = Infinity;
+      for (const enemy of state.enemies) {
+        const d = Math.hypot(enemy.x - pet.x, enemy.y - pet.y);
+        if (d <= stats.range && d < bestDist) {
+          best = enemy;
+          bestDist = d;
+        }
+      }
+      if (!best) {
+        pet.zapTimer = 0.25;
+        return;
+      }
+      pet.zapTimer = stats.interval;
+      spawnChainArc(pet.x, pet.y, best.x, best.y, this.color);
+      best.hp -= stats.damage;
+      applySlowToEnemy(best, stats.slowMultiplier, stats.slowDuration);
+      spawnFloatingText(best.x, best.y - best.radius, `-${Math.round(stats.damage)}`, this.color);
+      playSound("plasmaHit");
+      const idx = state.enemies.indexOf(best);
+      if (best.hp <= 0 && idx >= 0) {
+        handleEnemyDeath(best, idx);
+      } else {
+        const pseudoProjectile = {
+          damage: stats.damage,
+          chainTargets: stats.chainTargets,
+          chainRange: stats.chainRange,
+          chainDamageFactor: stats.chainDamageFactor,
+          chainDecay: stats.chainDecay,
+          slowMultiplier: stats.slowMultiplier,
+          slowDuration: stats.slowDuration,
+          color: this.color,
+          hitIds: new Set([best.id]),
+        };
+        applyChainDamage(best.x, best.y, pseudoProjectile, best.id);
+      }
+    },
+    drawInRun(pet, cameraX, cameraY) {
+      const sx = pet.x - cameraX + canvas.width / 2;
+      const sy = pet.y - cameraY + canvas.height / 2;
+      ctx.save();
+      ctx.fillStyle = this.color;
+      ctx.strokeStyle = "#1a1030";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(sx, sy + 1, 10, 7, 0, 0, TAU);
+      ctx.fill();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(sx - 6, sy - 5);
+      ctx.lineTo(sx - 9, sy - 11);
+      ctx.lineTo(sx - 3, sy - 7);
+      ctx.closePath();
+      ctx.moveTo(sx + 6, sy - 5);
+      ctx.lineTo(sx + 9, sy - 11);
+      ctx.lineTo(sx + 3, sy - 7);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#1a1030";
+      ctx.fillRect(sx - 3, sy - 1, 2, 2);
+      ctx.fillRect(sx + 1, sy - 1, 2, 2);
+      ctx.restore();
+    },
+  },
+  phoenixChick: {
+    key: "phoenixChick",
+    price: 1500,
+    origin: "wheel",
+    color: "#ffb15a",
+    rarity: "legendary",
+    getStats() {
+      return { reviveHp: 0.1, invuln: 1.4 };
+    },
+    applyPassive() {
+      /* revive handled by tryPhoenixRevive */
+    },
+    initRuntime(pet) {
+      pet.reviveAvailable = true;
+      pet.flapPhase = 0;
+    },
+    updateInRun(pet, dt) {
+      pet.flapPhase = (pet.flapPhase || 0) + dt * 12;
+    },
+    drawInRun(pet, cameraX, cameraY) {
+      const sx = pet.x - cameraX + canvas.width / 2;
+      const sy = pet.y - cameraY + canvas.height / 2;
+      ctx.save();
+      const glowAlpha = pet.reviveAvailable ? 0.55 : 0.18;
+      ctx.fillStyle = hexToRgba(this.color, glowAlpha);
+      ctx.beginPath();
+      ctx.arc(sx, sy, 14, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = this.color;
+      ctx.strokeStyle = "#3a1a05";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(sx, sy, 9, 8, 0, 0, TAU);
+      ctx.fill();
+      ctx.stroke();
+      const wing = Math.sin(pet.flapPhase || 0) * 4;
+      ctx.beginPath();
+      ctx.ellipse(sx - 6, sy + wing, 5, 3, -0.4, 0, TAU);
+      ctx.fill();
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.ellipse(sx + 6, sy + wing, 5, 3, 0.4, 0, TAU);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#3a1a05";
+      ctx.fillRect(sx - 2, sy - 2, 2, 2);
+      ctx.fillRect(sx + 1, sy - 2, 2, 2);
+      ctx.restore();
+    },
+  },
+};
+
+function getPetDef(key) {
+  return key && petDefinitions[key] ? petDefinitions[key] : null;
+}
+
+function listPetsByOrigin(origin) {
+  return Object.values(petDefinitions).filter((p) => p.origin === origin);
+}
+
 const state = {
   phase: "menu",
   elapsed: 0,
@@ -383,6 +699,12 @@ const state = {
     page: 0,
     pageSize: 6,
   },
+  meta: {
+    coins: 0,
+    ownedPets: new Set(),
+    equippedPet: null,
+  },
+  pet: null,
   touch: {
     active: false,
     id: null,
@@ -509,8 +831,77 @@ function resetRunState() {
   state.bossSpawnedInWave = false;
   state.waveAnnouncementTimer = 2.2;
   state.nextEnemyId = 1;
+  spawnEquippedPet();
   updateBossBar();
   updateHud();
+}
+
+function spawnEquippedPet() {
+  state.pet = null;
+  const def = getPetDef(state.meta.equippedPet);
+  if (!def || !state.player) {
+    return;
+  }
+  if (typeof def.applyPassive === "function") {
+    def.applyPassive(state.player);
+  }
+  const pet = {
+    key: def.key,
+    x: state.player.x - 36,
+    y: state.player.y - 24,
+  };
+  if (typeof def.initRuntime === "function") {
+    def.initRuntime(pet);
+  }
+  state.pet = pet;
+}
+
+function updatePet(dt) {
+  if (!state.pet || !state.player) {
+    return;
+  }
+  const def = getPetDef(state.pet.key);
+  if (!def) {
+    state.pet = null;
+    return;
+  }
+  const targetX = state.player.x - Math.cos(state.player.facing) * 36;
+  const targetY = state.player.y - Math.sin(state.player.facing) * 36 - 18;
+  const followSpeed = 6;
+  state.pet.x += (targetX - state.pet.x) * Math.min(1, followSpeed * dt);
+  state.pet.y += (targetY - state.pet.y) * Math.min(1, followSpeed * dt);
+  state.pet.bobPhase = (state.pet.bobPhase || 0) + dt * 5;
+  state.pet.y += Math.sin(state.pet.bobPhase) * 0.6;
+  if (typeof def.updateInRun === "function") {
+    def.updateInRun(state.pet, dt);
+  }
+}
+
+function drawPet(cameraX, cameraY) {
+  if (!state.pet) {
+    return;
+  }
+  const def = getPetDef(state.pet.key);
+  if (def && typeof def.drawInRun === "function") {
+    def.drawInRun(state.pet, cameraX, cameraY);
+  }
+}
+
+function tryPhoenixRevive() {
+  if (!state.pet) {
+    return false;
+  }
+  const def = getPetDef(state.pet.key);
+  if (!def || def.key !== "phoenixChick" || !state.pet.reviveAvailable) {
+    return false;
+  }
+  const stats = def.getStats();
+  state.pet.reviveAvailable = false;
+  state.player.invulnerableTimer = Math.max(state.player.invulnerableTimer, stats.invuln);
+  spawnFloatingText(state.player.x, state.player.y - 32, t("pet.phoenix.revive"), def.color);
+  message.textContent = t("pet.phoenix.reviveMsg");
+  playSound("levelup");
+  return true;
 }
 
 function showOverlay(title, text, buttons) {
@@ -765,6 +1156,41 @@ function saveCodexProgress() {
   }
 }
 
+function loadMetaProgress() {
+  try {
+    const raw = localStorage.getItem(META_PROGRESS_KEY);
+    if (!raw) {
+      state.meta.coins = 0;
+      state.meta.ownedPets = new Set();
+      state.meta.equippedPet = null;
+      return;
+    }
+    const data = JSON.parse(raw);
+    const coins = typeof data.coins === "number" && Number.isFinite(data.coins) ? Math.max(0, Math.floor(data.coins)) : 0;
+    const owned = Array.isArray(data.ownedPets) ? data.ownedPets : [];
+    const equipped = typeof data.equippedPet === "string" ? data.equippedPet : null;
+    state.meta.coins = coins;
+    state.meta.ownedPets = new Set(owned.filter((key) => typeof petDefinitions !== "undefined" && petDefinitions[key]));
+    state.meta.equippedPet = equipped && state.meta.ownedPets.has(equipped) ? equipped : null;
+  } catch (_) {
+    state.meta.coins = 0;
+    state.meta.ownedPets = new Set();
+    state.meta.equippedPet = null;
+  }
+}
+
+function saveMetaProgress() {
+  try {
+    localStorage.setItem(META_PROGRESS_KEY, JSON.stringify({
+      coins: state.meta.coins,
+      ownedPets: [...state.meta.ownedPets],
+      equippedPet: state.meta.equippedPet,
+    }));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
 function discoverWeapon(type) {
   if (!weaponDefinitions[type] || state.codex.discoveredWeapons.has(type)) {
     return;
@@ -819,6 +1245,16 @@ function openMainMenuOverlay() {
       label: t("menu.codex.label"),
       description: t("menu.codex.desc"),
       onClick: showCodexRootFromMenu,
+    },
+    {
+      label: t("menu.shop.label"),
+      description: t("menu.shop.desc"),
+      onClick: showShopFromMenu,
+    },
+    {
+      label: t("menu.wheel.label"),
+      description: t("menu.wheel.desc"),
+      onClick: showWheelFromMenu,
     },
   ]);
 }
@@ -1244,6 +1680,388 @@ function showLeaderboardFromMenu() {
   upgradeOptions.appendChild(backBtn);
 }
 
+function formatCoins(amount) {
+  const loc = currentLocale === "en" ? "en-US" : "zh-CN";
+  return Math.max(0, Math.floor(amount)).toLocaleString(loc);
+}
+
+function buildPetStatsLine(def) {
+  const key = def.key;
+  const stats = def.getStats();
+  if (key === "scoutDroid") {
+    return t("pet.scoutDroid.stats", {
+      damage: stats.damage,
+      cooldown: stats.cooldown.toFixed(1),
+      range: stats.range,
+    });
+  }
+  if (key === "magnetCore") {
+    return t("pet.magnetCore.stats", {
+      magnet: stats.magnetBonus,
+      pulse: stats.pulseInterval,
+      range: stats.pulseRange,
+    });
+  }
+  if (key === "medicBee") {
+    return t("pet.medicBee.stats", {
+      heal: stats.healAmount,
+      interval: stats.interval,
+    });
+  }
+  if (key === "thunderPup") {
+    return t("pet.thunderPup.stats", {
+      damage: stats.damage,
+      interval: stats.interval,
+      range: stats.range,
+      chain: stats.chainTargets,
+    });
+  }
+  if (key === "phoenixChick") {
+    return t("pet.phoenixChick.stats", {
+      hp: Math.round(stats.reviveHp * 100),
+      invuln: stats.invuln.toFixed(1),
+    });
+  }
+  return "";
+}
+
+function createShopCard(def) {
+  const card = document.createElement("div");
+  card.className = "shop-card";
+  card.dataset.rarity = def.rarity || "common";
+  card.style.setProperty("--shop-accent", def.color);
+
+  const icon = document.createElement("div");
+  icon.className = "shop-card-icon";
+  icon.textContent = t(`pet.${def.key}.icon`);
+  icon.style.color = def.color;
+  card.appendChild(icon);
+
+  const name = document.createElement("h3");
+  name.className = "shop-card-name";
+  name.textContent = t(`pet.${def.key}.name`);
+  card.appendChild(name);
+
+  const origin = document.createElement("div");
+  origin.className = "shop-card-origin";
+  origin.textContent = def.origin === "wheel" ? t("pet.origin.wheel") : t("pet.origin.shop");
+  card.appendChild(origin);
+
+  const desc = document.createElement("p");
+  desc.className = "shop-card-desc";
+  desc.textContent = t(`pet.${def.key}.desc`);
+  card.appendChild(desc);
+
+  const stats = document.createElement("p");
+  stats.className = "shop-card-stats";
+  stats.textContent = buildPetStatsLine(def);
+  card.appendChild(stats);
+
+  const owned = state.meta.ownedPets.has(def.key);
+  const equipped = state.meta.equippedPet === def.key;
+  const canAfford = state.meta.coins >= def.price;
+
+  const footer = document.createElement("div");
+  footer.className = "shop-card-footer";
+
+  const priceBadge = document.createElement("span");
+  priceBadge.className = "shop-card-price";
+  priceBadge.textContent = owned ? t("shop.owned") : t("shop.pricePill", { price: formatCoins(def.price) });
+  footer.appendChild(priceBadge);
+
+  const actionBtn = document.createElement("button");
+  actionBtn.type = "button";
+  actionBtn.className = "shop-card-btn";
+
+  if (equipped) {
+    actionBtn.textContent = t("shop.equipped");
+    actionBtn.classList.add("is-equipped");
+    actionBtn.disabled = true;
+  } else if (owned) {
+    actionBtn.textContent = t("shop.equip");
+    actionBtn.addEventListener("click", () => {
+      state.meta.equippedPet = def.key;
+      saveMetaProgress();
+      showShopFromMenu();
+    });
+  } else if (!canAfford) {
+    actionBtn.textContent = t("shop.locked");
+    actionBtn.disabled = true;
+    actionBtn.classList.add("is-locked");
+  } else {
+    actionBtn.textContent = t("shop.buy");
+    actionBtn.addEventListener("click", () => {
+      if (state.meta.coins < def.price) return;
+      state.meta.coins -= def.price;
+      state.meta.ownedPets.add(def.key);
+      if (!state.meta.equippedPet) {
+        state.meta.equippedPet = def.key;
+      }
+      saveMetaProgress();
+      playSound("pickup");
+      showShopFromMenu();
+    });
+  }
+  footer.appendChild(actionBtn);
+  card.appendChild(footer);
+
+  return card;
+}
+
+function showShopFromMenu() {
+  state.phase = "menu_shop";
+  overlayCard.querySelectorAll(".codex-info-panel--floating").forEach((panel) => panel.remove());
+  overlayTitle.textContent = t("shop.title");
+  overlayText.textContent = t("shop.hint");
+  overlay.classList.remove("hidden");
+  overlayCard.classList.remove("overlay-card--codex");
+  upgradeOptions.className = "upgrade-options upgrade-options--shop";
+  upgradeOptions.innerHTML = "";
+
+  const balance = document.createElement("div");
+  balance.className = "meta-balance";
+  balance.innerHTML = `<span class="meta-balance-label">${t("meta.coinsName")}</span><strong class="meta-balance-value">${formatCoins(state.meta.coins)}</strong>`;
+  upgradeOptions.appendChild(balance);
+
+  const grid = document.createElement("div");
+  grid.className = "shop-grid";
+  for (const def of listPetsByOrigin("shop")) {
+    grid.appendChild(createShopCard(def));
+  }
+  upgradeOptions.appendChild(grid);
+
+  const equippedRow = document.createElement("div");
+  equippedRow.className = "shop-equipped-row";
+  if (state.meta.equippedPet) {
+    const def = getPetDef(state.meta.equippedPet);
+    if (def) {
+      equippedRow.innerHTML = `<span>${t("shop.currentEquip", { name: t(`pet.${def.key}.name`) })}</span>`;
+      const unequip = document.createElement("button");
+      unequip.type = "button";
+      unequip.className = "shop-unequip-btn";
+      unequip.textContent = t("shop.unequip");
+      unequip.addEventListener("click", () => {
+        state.meta.equippedPet = null;
+        saveMetaProgress();
+        showShopFromMenu();
+      });
+      equippedRow.appendChild(unequip);
+    }
+  } else {
+    equippedRow.innerHTML = `<span class="shop-equipped-empty">${t("shop.noEquip")}</span>`;
+  }
+  upgradeOptions.appendChild(equippedRow);
+
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "upgrade-button codex-back-button";
+  backBtn.innerHTML = `<strong>${t("shop.back.label")}</strong><span>${t("shop.back.desc")}</span>`;
+  backBtn.addEventListener("click", openMainMenuOverlay);
+  upgradeOptions.appendChild(backBtn);
+}
+
+function buildWheelPool() {
+  const pool = [
+    { id: "coins_small", type: "coins", amount: 20, weight: 30, label: t("wheel.prize.coinsSmall", { amount: 20 }), color: "#ffd166" },
+    { id: "coins_med", type: "coins", amount: 60, weight: 22, label: t("wheel.prize.coinsMed", { amount: 60 }), color: "#ffb347" },
+    { id: "coins_big", type: "coins", amount: 160, weight: 10, label: t("wheel.prize.coinsBig", { amount: 160 }), color: "#ff8c42" },
+    { id: "coins_huge", type: "coins", amount: 360, weight: 3, label: t("wheel.prize.coinsHuge", { amount: 360 }), color: "#ff5e5b" },
+  ];
+  for (const def of listPetsByOrigin("wheel")) {
+    pool.push({
+      id: `pet_${def.key}`,
+      type: "pet",
+      petKey: def.key,
+      weight: def.rarity === "legendary" ? 2 : 7,
+      label: t(`pet.${def.key}.name`),
+      color: def.color,
+    });
+  }
+  for (const def of listPetsByOrigin("shop")) {
+    pool.push({
+      id: `petShop_${def.key}`,
+      type: "pet",
+      petKey: def.key,
+      weight: 6,
+      label: t(`pet.${def.key}.name`),
+      color: def.color,
+    });
+  }
+  return pool;
+}
+
+function pickWheelPrize(pool) {
+  const total = pool.reduce((sum, p) => sum + p.weight, 0);
+  let roll = Math.random() * total;
+  for (const entry of pool) {
+    roll -= entry.weight;
+    if (roll <= 0) {
+      return entry;
+    }
+  }
+  return pool[pool.length - 1];
+}
+
+function resolveWheelPrize(prize) {
+  if (prize.type === "coins") {
+    state.meta.coins += prize.amount;
+    saveMetaProgress();
+    return {
+      title: t("wheel.result.coinsTitle"),
+      body: t("wheel.result.coinsBody", { amount: formatCoins(prize.amount), total: formatCoins(state.meta.coins) }),
+      color: prize.color,
+    };
+  }
+  if (prize.type === "pet") {
+    const def = getPetDef(prize.petKey);
+    if (!def) {
+      return { title: t("wheel.result.coinsTitle"), body: "", color: "#ffd166" };
+    }
+    if (state.meta.ownedPets.has(prize.petKey)) {
+      const refund = Math.floor(def.price * 0.6);
+      state.meta.coins += refund;
+      saveMetaProgress();
+      return {
+        title: t("wheel.result.duplicateTitle", { name: t(`pet.${def.key}.name`) }),
+        body: t("wheel.result.duplicateBody", { refund: formatCoins(refund), total: formatCoins(state.meta.coins) }),
+        color: def.color,
+      };
+    }
+    state.meta.ownedPets.add(prize.petKey);
+    if (!state.meta.equippedPet) {
+      state.meta.equippedPet = prize.petKey;
+    }
+    saveMetaProgress();
+    return {
+      title: t("wheel.result.petTitle", { name: t(`pet.${def.key}.name`) }),
+      body: t("wheel.result.petBody", { desc: t(`pet.${def.key}.desc`) }),
+      color: def.color,
+    };
+  }
+  return { title: "", body: "", color: "#ffd166" };
+}
+
+function showWheelFromMenu() {
+  state.phase = "menu_wheel";
+  overlayCard.querySelectorAll(".codex-info-panel--floating").forEach((panel) => panel.remove());
+  overlayTitle.textContent = t("wheel.title");
+  overlayText.textContent = t("wheel.hint", { cost: WHEEL_SPIN_COST });
+  overlay.classList.remove("hidden");
+  overlayCard.classList.remove("overlay-card--codex");
+  upgradeOptions.className = "upgrade-options upgrade-options--wheel";
+  upgradeOptions.innerHTML = "";
+
+  const balance = document.createElement("div");
+  balance.className = "meta-balance";
+  balance.innerHTML = `<span class="meta-balance-label">${t("meta.coinsName")}</span><strong class="meta-balance-value">${formatCoins(state.meta.coins)}</strong>`;
+  upgradeOptions.appendChild(balance);
+
+  const pool = buildWheelPool();
+
+  const stage = document.createElement("div");
+  stage.className = "wheel-stage";
+
+  const disc = document.createElement("div");
+  disc.className = "wheel-disc";
+
+  const sliceCount = pool.length;
+  const sliceAngle = 360 / sliceCount;
+  const gradientStops = [];
+  for (let i = 0; i < sliceCount; i += 1) {
+    const start = i * sliceAngle;
+    const end = (i + 1) * sliceAngle;
+    gradientStops.push(`${pool[i].color} ${start}deg ${end}deg`);
+  }
+  disc.style.background = `conic-gradient(${gradientStops.join(", ")})`;
+
+  const labelsLayer = document.createElement("div");
+  labelsLayer.className = "wheel-labels";
+  for (let i = 0; i < sliceCount; i += 1) {
+    const label = document.createElement("span");
+    label.className = "wheel-label";
+    label.style.transform = `rotate(${i * sliceAngle + sliceAngle / 2}deg) translate(0, -86px)`;
+    label.textContent = pool[i].label;
+    labelsLayer.appendChild(label);
+  }
+  disc.appendChild(labelsLayer);
+  stage.appendChild(disc);
+
+  const pointer = document.createElement("div");
+  pointer.className = "wheel-pointer";
+  stage.appendChild(pointer);
+
+  upgradeOptions.appendChild(stage);
+
+  const resultBox = document.createElement("div");
+  resultBox.className = "wheel-result";
+  resultBox.innerHTML = `<span class="wheel-result-placeholder">${t("wheel.idle")}</span>`;
+  upgradeOptions.appendChild(resultBox);
+
+  const controls = document.createElement("div");
+  controls.className = "wheel-controls";
+
+  const spinBtn = document.createElement("button");
+  spinBtn.type = "button";
+  spinBtn.className = "shop-card-btn is-spin";
+  spinBtn.textContent = t("wheel.spinButton", { cost: WHEEL_SPIN_COST });
+  controls.appendChild(spinBtn);
+
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "upgrade-button codex-back-button";
+  backBtn.innerHTML = `<strong>${t("wheel.back.label")}</strong><span>${t("wheel.back.desc")}</span>`;
+  backBtn.addEventListener("click", openMainMenuOverlay);
+  controls.appendChild(backBtn);
+
+  upgradeOptions.appendChild(controls);
+
+  let currentRotation = 0;
+  let spinning = false;
+
+  function updateBalance() {
+    balance.querySelector(".meta-balance-value").textContent = formatCoins(state.meta.coins);
+    const canAfford = state.meta.coins >= WHEEL_SPIN_COST;
+    spinBtn.disabled = spinning || !canAfford;
+    spinBtn.classList.toggle("is-locked", !spinning && !canAfford);
+    spinBtn.textContent = spinning
+      ? t("wheel.rolling")
+      : !canAfford
+        ? t("wheel.needMore", { cost: WHEEL_SPIN_COST })
+        : t("wheel.spinButton", { cost: WHEEL_SPIN_COST });
+  }
+
+  updateBalance();
+
+  spinBtn.addEventListener("click", () => {
+    if (spinning) return;
+    if (state.meta.coins < WHEEL_SPIN_COST) return;
+    spinning = true;
+    state.meta.coins -= WHEEL_SPIN_COST;
+    saveMetaProgress();
+    updateBalance();
+
+    const prize = pickWheelPrize(pool);
+    const prizeIndex = pool.indexOf(prize);
+    const targetAngle = 270 - (prizeIndex * sliceAngle + sliceAngle / 2);
+    const baseSpins = 5;
+    const final = currentRotation + baseSpins * 360 + (((targetAngle - (currentRotation % 360)) % 360) + 360) % 360;
+    currentRotation = final;
+    disc.style.transition = "transform 3s cubic-bezier(0.18, 0.84, 0.32, 1)";
+    disc.style.transform = `rotate(${final}deg)`;
+    resultBox.innerHTML = `<span class="wheel-result-rolling">${t("wheel.rolling")}</span>`;
+
+    playSound("levelup");
+
+    window.setTimeout(() => {
+      const resolved = resolveWheelPrize(prize);
+      resultBox.innerHTML = `<strong class="wheel-result-title" style="color:${resolved.color}">${resolved.title}</strong><span class="wheel-result-body">${resolved.body}</span>`;
+      playSound("pickup");
+      spinning = false;
+      updateBalance();
+    }, 3050);
+  });
+}
+
 function updateHud() {
   const player = state.player;
   hpText.textContent = `${Math.ceil(player.hp)} / ${player.maxHp}`;
@@ -1539,6 +2357,7 @@ function clamp(value, min, max) {
 })();
 
 loadCodexProgress();
+loadMetaProgress();
 
 function normalizeVector(x, y) {
   const length = Math.hypot(x, y);
@@ -2395,9 +3214,13 @@ function updateEnemies(dt) {
         spawnFloatingText(player.x, player.y - 24, `-${Math.round(enemy.damage)}`, "#ffb7b7");
 
         if (player.hp <= 0) {
-          player.hp = 0;
-          triggerGameOver();
-          return;
+          if (tryPhoenixRevive()) {
+            player.hp = Math.max(1, Math.round(player.maxHp * 0.1));
+          } else {
+            player.hp = 0;
+            triggerGameOver();
+            return;
+          }
         }
       }
     }
@@ -2664,14 +3487,20 @@ function showGameOverOverlay() {
     return;
   }
   const loc = currentLocale === "en" ? "en-US" : "zh-CN";
+  const coinsEarned = typeof g.coinsEarned === "number" ? g.coinsEarned : 0;
+  const bodyMain = t("go.body", {
+    score: g.finalScore.toLocaleString(loc),
+    time: formatTime(g.elapsed),
+    wave: g.wave,
+    kills: g.kills,
+  });
+  const bodyCoins = t("go.coinsLine", {
+    coins: coinsEarned.toLocaleString(loc),
+    total: state.meta.coins.toLocaleString(loc),
+  });
   showOverlay(
     t("go.title"),
-    t("go.body", {
-      score: g.finalScore.toLocaleString(loc),
-      time: formatTime(g.elapsed),
-      wave: g.wave,
-      kills: g.kills,
-    }),
+    `${bodyMain}\n${bodyCoins}`,
     [
       {
         label: t("go.again.label"),
@@ -2690,11 +3519,17 @@ function showGameOverOverlay() {
 function triggerGameOver() {
   recordLeaderboardEntry();
   const finalScore = computeRunScore();
+  const coinsEarned = Math.max(0, Math.floor(finalScore / COIN_CONVERSION_RATIO));
+  if (coinsEarned > 0) {
+    state.meta.coins += coinsEarned;
+    saveMetaProgress();
+  }
   state.lastGameOver = {
     finalScore,
     elapsed: state.elapsed,
     wave: state.wave,
     kills: state.kills,
+    coinsEarned,
   };
   state.phase = "gameover";
   playSound("gameover");
@@ -2720,6 +3555,7 @@ function update(dt) {
   updateDashTrailParticles(dt);
   updateLaserHitParticles(dt);
   updateChainArcs(dt);
+  updatePet(dt);
 
   const laserLockFacing = state.player.weapons.some(
     (w) => w.type === "laser" && w.beamTimeLeft > 0
@@ -3062,6 +3898,7 @@ function draw() {
   drawDashTrailParticles(cameraX, cameraY);
   drawLaserHitParticles(cameraX, cameraY);
   drawLaserBeams();
+  drawPet(cameraX, cameraY);
   drawPlayer();
   drawFloatingTexts(cameraX, cameraY);
   drawWaveBanner();

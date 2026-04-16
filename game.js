@@ -45,6 +45,29 @@ const overlayTitle = document.getElementById("overlayTitle");
 const overlayText = document.getElementById("overlayText");
 const upgradeOptions = document.getElementById("upgradeOptions");
 
+function playUiClickSound() {
+  ensureAudio();
+  playSound("ui");
+}
+
+overlay.addEventListener(
+  "click",
+  (e) => {
+    const t = e.target;
+    if (!(t instanceof Element)) {
+      return;
+    }
+    const btn = t.closest(
+      "button.upgrade-button, button.shop-card-btn, button.codex-card, button.codex-root-card, button.codex-page-button, button.shop-unequip-btn",
+    );
+    if (!btn || !overlay.contains(btn)) {
+      return;
+    }
+    playUiClickSound();
+  },
+  true,
+);
+
 const bossBar = document.getElementById("bossBar");
 const bossName = document.getElementById("bossName");
 const bossWave = document.getElementById("bossWave");
@@ -67,7 +90,8 @@ const LEADERBOARD_KEY = "rogueZLeaderboardV1";
 const LEADERBOARD_MAX = 5;
 const CODEX_PROGRESS_KEY = "rogueZCodexV1";
 const META_PROGRESS_KEY = "rogueZMetaV1";
-const COIN_CONVERSION_RATIO = 10;
+/** 终局分 → 金币：金币 = floor(finalScore / ratio)。数值越大，单局金币越少。 */
+const COIN_CONVERSION_RATIO = 20;
 const WHEEL_SPIN_COST = 80;
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 
@@ -176,7 +200,11 @@ function refreshMessageBarForLocale() {
       message.textContent = t("msg.paused");
       break;
     case "menu_settings":
+    case "menu_settings_controls":
       message.textContent = t("msg.menuHint");
+      break;
+    case "paused_settings_controls":
+      message.textContent = t("msg.paused");
       break;
     case "levelup":
       message.textContent = t("msg.levelUpPick");
@@ -242,8 +270,14 @@ function applyLanguageToOpenOverlay() {
     case "paused_settings":
       showSettingsOverlay(true);
       break;
+    case "paused_settings_controls":
+      showControlsOverlay(true);
+      break;
     case "menu_settings":
       showSettingsOverlay(false);
+      break;
+    case "menu_settings_controls":
+      showControlsOverlay(false);
       break;
     case "gameover":
       showGameOverOverlay();
@@ -718,6 +752,7 @@ const state = {
     lastHitAt: 0,
     lastLaserHumAt: 0,
     lastPlasmaHitAt: 0,
+    lastUiAt: 0,
     volume: 1,
     outputBoost: 2.35,
   },
@@ -904,7 +939,11 @@ function tryPhoenixRevive() {
   return true;
 }
 
-function showOverlay(title, text, buttons) {
+function showOverlay(title, text, buttons, options = {}) {
+  const levelUpKeyboard = options.levelUpKeyboard === true;
+  if (levelUpKeyboard) {
+    clearLevelUpKeyboardNav();
+  }
   overlayCard.querySelectorAll(".codex-info-panel--floating").forEach((panel) => panel.remove());
   overlayTitle.textContent = title;
   overlayText.textContent = text;
@@ -913,6 +952,7 @@ function showOverlay(title, text, buttons) {
   upgradeOptions.className = "upgrade-options";
   upgradeOptions.innerHTML = "";
 
+  const buttonElements = [];
   for (const buttonConfig of buttons) {
     const button = document.createElement("button");
     button.type = "button";
@@ -920,10 +960,20 @@ function showOverlay(title, text, buttons) {
     button.innerHTML = `<strong>${buttonConfig.label}</strong><span>${buttonConfig.description}</span>`;
     button.addEventListener("click", buttonConfig.onClick);
     upgradeOptions.appendChild(button);
+    buttonElements.push(button);
+    if (levelUpKeyboard) {
+      const idx = buttonElements.length - 1;
+      button.addEventListener("mouseenter", () => setLevelUpChoiceFocus(idx));
+    }
+  }
+  if (levelUpKeyboard && buttonElements.length > 0) {
+    levelUpChoiceButtons = buttonElements;
+    setLevelUpChoiceFocus(0);
   }
 }
 
 function hideOverlay() {
+  clearLevelUpKeyboardNav();
   overlayCard.querySelectorAll(".codex-info-panel--floating").forEach((panel) => panel.remove());
   overlay.classList.add("hidden");
   overlayCard.classList.remove("overlay-card--codex");
@@ -1047,6 +1097,13 @@ function showSettingsOverlay(fromPause) {
   langRow.appendChild(langSelect);
   upgradeOptions.appendChild(langRow);
 
+  const controlsBtn = document.createElement("button");
+  controlsBtn.type = "button";
+  controlsBtn.className = "upgrade-button";
+  controlsBtn.innerHTML = `<strong>${t("settings.controls.label")}</strong><span>${t("settings.controls.desc")}</span>`;
+  controlsBtn.addEventListener("click", () => showControlsOverlay(fromPause));
+  upgradeOptions.appendChild(controlsBtn);
+
   const backBtn = document.createElement("button");
   backBtn.type = "button";
   backBtn.className = "upgrade-button";
@@ -1062,6 +1119,51 @@ function showSettingsOverlay(fromPause) {
       openMainMenuOverlay();
     }
   });
+  upgradeOptions.appendChild(backBtn);
+}
+
+function showControlsOverlay(fromPause) {
+  state.phase = fromPause ? "paused_settings_controls" : "menu_settings_controls";
+  overlayTitle.textContent = t("controls.title");
+  overlayText.textContent = t("controls.hint");
+  overlay.classList.remove("hidden");
+  overlayCard.classList.remove("overlay-card--codex");
+  upgradeOptions.className = "upgrade-options upgrade-options--settings";
+  upgradeOptions.innerHTML = "";
+
+  const wrap = document.createElement("div");
+  wrap.className = "settings-controls-wrap";
+  const list = document.createElement("div");
+  list.className = "settings-controls-list";
+
+  const rows = [
+    ["controls.move", "controls.move.keys"],
+    ["controls.dash", "controls.dash.keys"],
+    ["controls.pause", "controls.pause.keys"],
+    ["controls.menuEnter", "controls.menuEnter.keys"],
+    ["controls.touch", "controls.touch.keys"],
+  ];
+  for (const [actionKey, keysKey] of rows) {
+    const row = document.createElement("div");
+    row.className = "settings-controls-row";
+    const act = document.createElement("span");
+    act.className = "settings-controls-action";
+    act.textContent = t(actionKey);
+    const keys = document.createElement("span");
+    keys.className = "settings-controls-keys";
+    keys.textContent = t(keysKey);
+    row.appendChild(act);
+    row.appendChild(keys);
+    list.appendChild(row);
+  }
+  wrap.appendChild(list);
+  upgradeOptions.appendChild(wrap);
+
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "upgrade-button";
+  backBtn.innerHTML = `<strong>${t("controls.back.label")}</strong><span>${t("controls.back.desc")}</span>`;
+  backBtn.addEventListener("click", () => showSettingsOverlay(fromPause));
   upgradeOptions.appendChild(backBtn);
 }
 
@@ -1325,26 +1427,102 @@ function buildEnemyCodexSummary(kind) {
 }
 
 function getCodexCardVisuals(category, key) {
-  const accent = "#90a4ff";
   if (category === "enemies") {
     const map = {
-      walker: { accent, icon: "Z", rarity: "standard" },
-      runner: { accent, icon: ">>", rarity: "standard" },
-      brute: { accent, icon: "B", rarity: "standard" },
-      boss: { accent, icon: "BOSS", rarity: "standard" },
+      walker: { accent: "#8fd4a0", icon: "Z", rarity: "standard" },
+      runner: { accent: "#ff9b7a", icon: ">>", rarity: "standard" },
+      brute: { accent: "#c4a8ff", icon: "B", rarity: "rare" },
+      boss: { accent: "#ff7a95", icon: "BOSS", rarity: "legendary" },
     };
-    return map[key] || { accent, icon: "?", rarity: "standard" };
+    return map[key] || { accent: "#90a4ff", icon: "?", rarity: "standard" };
   }
 
   const map = {
-    pistol: { accent, icon: "P", rarity: "standard" },
-    smg: { accent, icon: "SMG", rarity: "standard" },
-    shotgun: { accent, icon: "SG", rarity: "standard" },
-    rifle: { accent, icon: "AR", rarity: "standard" },
-    laser: { accent, icon: "LZR", rarity: "standard" },
-    plasma: { accent, icon: "PLS", rarity: "standard" },
+    pistol: { accent: "#ffe38c", icon: "P", rarity: "standard" },
+    smg: { accent: "#8ce6ff", icon: "SMG", rarity: "standard" },
+    shotgun: { accent: "#ffd9a6", icon: "SG", rarity: "standard" },
+    rifle: { accent: "#ffb2b2", icon: "AR", rarity: "standard" },
+    laser: { accent: "#66ffc8", icon: "LZR", rarity: "standard" },
+    plasma: { accent: "#8ef6ff", icon: "PLS", rarity: "standard" },
   };
-  return map[key] || { accent, icon: "?", rarity: "standard" };
+  return map[key] || { accent: "#90a4ff", icon: "?", rarity: "standard" };
+}
+
+const CODEX_WEAPON_SVG_NS = "http://www.w3.org/2000/svg";
+
+function getCodexWeaponIconSvg(weaponType) {
+  const S = CODEX_WEAPON_SVG_NS;
+  const wrap = (inner) =>
+    `<svg xmlns="${S}" viewBox="0 0 40 40" width="40" height="40" class="codex-weapon-icon-svg" aria-hidden="true">${inner}</svg>`;
+
+  const pistol = wrap(
+    `<g fill="currentColor"><rect x="7" y="20" width="5" height="9" rx="1"/><rect x="12" y="17" width="13" height="7" rx="1"/><rect x="25" y="18" width="11" height="5" rx="0.5"/><rect x="14" y="14" width="9" height="4" rx="0.5"/></g>`,
+  );
+  const smg = wrap(
+    `<g fill="currentColor"><rect x="9" y="22" width="4" height="9" rx="0.5"/><rect x="13" y="14" width="18" height="10" rx="1.5"/><rect x="31" y="16" width="9" height="6" rx="0.5"/><rect x="16" y="10" width="10" height="5" rx="0.5"/></g>`,
+  );
+  const shotgun = wrap(
+    `<g fill="currentColor"><rect x="6" y="18" width="6" height="10" rx="1"/><rect x="12" y="15" width="11" height="13" rx="1"/><rect x="23" y="16" width="5" height="5" rx="0.5"/><rect x="23" y="23" width="5" height="5" rx="0.5"/><rect x="28" y="17" width="7" height="10" rx="0.5"/></g>`,
+  );
+  const rifle = wrap(
+    `<g fill="currentColor"><rect x="4" y="19" width="7" height="8" rx="1"/><rect x="11" y="16" width="10" height="11" rx="1"/><rect x="21" y="17" width="20" height="7" rx="0.5"/><rect x="13" y="12" width="8" height="5" rx="0.5"/></g>`,
+  );
+  const laser = `<svg xmlns="${S}" viewBox="0 0 44 40" width="40" height="40" class="codex-weapon-icon-svg codex-weapon-icon-svg--laser" aria-hidden="true"><g fill="currentColor"><rect x="4" y="19" width="7" height="8" rx="1"/><rect x="11" y="16" width="10" height="11" rx="1"/><rect x="21" y="17" width="14" height="7" rx="0.5"/></g><g stroke="currentColor" stroke-width="1.25" fill="none" stroke-linecap="round" opacity="0.9"><path d="M36 20h6M36 17h7M36 23h7"/></g></svg>`;
+  const plasma = wrap(
+    `<g fill="currentColor"><rect x="6" y="18" width="7" height="9" rx="1"/><rect x="13" y="15" width="14" height="12" rx="2"/><circle cx="32" cy="21" r="5.5" opacity="0.95"/><circle cx="32" cy="21" r="2.2" fill="#fff" fill-opacity="0.35"/></g>`,
+  );
+
+  const map = {
+    pistol,
+    smg,
+    shotgun,
+    rifle,
+    laser,
+    plasma,
+  };
+  return map[weaponType] || wrap(`<text x="20" y="24" text-anchor="middle" font-size="14" fill="currentColor">?</text>`);
+}
+
+/** SVG miniatures matching in-game enemy body colors; no HP bar (bars only appear in combat). */
+function getCodexEnemyIconSvg(kind) {
+  const S = CODEX_WEAPON_SVG_NS;
+  const wrap = (inner, extraClass = "") =>
+    `<svg xmlns="${S}" viewBox="0 0 40 40" width="40" height="40" class="codex-enemy-icon-svg${extraClass ? ` ${extraClass}` : ""}" aria-hidden="true">${inner}</svg>`;
+
+  const walker = wrap(
+    `<circle cx="20" cy="23" r="10" fill="#9bf25a"/>`,
+  );
+  const runner = wrap(
+    `<circle cx="20" cy="23" r="8.5" fill="#8ef7c5"/>`,
+  );
+  const brute = wrap(
+    `<circle cx="20" cy="23" r="11" fill="#ffb067"/>`,
+  );
+  const boss = wrap(
+    `<circle cx="20" cy="23" r="12.5" fill="#ff5d70" stroke="#ffd6dd" stroke-width="2.5"/>`,
+    "codex-enemy-icon-svg--boss",
+  );
+
+  const map = {
+    walker,
+    runner,
+    brute,
+    boss,
+  };
+  return map[kind] || wrap(`<circle cx="20" cy="23" r="8" fill="#90a4ff"/>`);
+}
+
+function codexIconMarkup(entry, category, visuals) {
+  if (category === "weapons" && entry.discovered) {
+    return getCodexWeaponIconSvg(entry.key);
+  }
+  if (category === "enemies" && entry.discovered) {
+    return getCodexEnemyIconSvg(entry.key);
+  }
+  if (!entry.discovered) {
+    return `<span class="codex-card-icon-text">${t("codex.locked.icon")}</span>`;
+  }
+  return `<span class="codex-card-icon-text">${visuals.icon}</span>`;
 }
 
 function createCodexCard(entry, category, index) {
@@ -1356,16 +1534,18 @@ function createCodexCard(entry, category, index) {
   card.dataset.category = category;
   card.dataset.rarity = visuals.rarity;
 
-  const displayName = entry.discovered ? entry.name : "";
-  const icon = entry.discovered ? visuals.icon : t("codex.locked.icon");
+  const name = entry.discovered ? entry.name : t("codex.locked.name");
+  const desc = entry.discovered ? entry.description : t("codex.locked.desc");
+  const kindLabel = category === "weapons" ? t("codex.weapons") : t("codex.enemies");
+  const idx = String(index + 1).padStart(2, "0");
+  const iconInner = codexIconMarkup(entry, category, visuals);
 
   card.innerHTML = `
-    <div class="codex-card-top">
-      <span class="codex-card-tag">${category === "weapons" ? t("codex.weapons") : t("codex.enemies")}</span>
-      <span class="codex-card-index">${String(index + 1).padStart(2, "0")}</span>
-    </div>
-    <div class="codex-card-art${entry.discovered ? "" : " codex-card-art--back"}">${icon}</div>
-    ${entry.discovered ? `<strong class="codex-card-name">${displayName}</strong>` : ""}
+    <span class="codex-card-index" aria-hidden="true">${idx}</span>
+    <div class="codex-card-icon${entry.discovered ? "" : " codex-card-icon--locked"}">${iconInner}</div>
+    <p class="codex-card-name">${name}</p>
+    <p class="codex-card-kind">${kindLabel}</p>
+    <p class="codex-card-desc">${desc}</p>
   `;
 
   return card;
@@ -1381,19 +1561,17 @@ function createCodexInfoPanel(entry, category) {
   const summary = entry.discovered ? entry.summary : t("codex.locked.stats");
   const badge = entry.discovered ? t("codex.discovered.badge") : t("codex.locked.badge");
   const categoryLabel = category === "weapons" ? t("codex.weapons") : t("codex.enemies");
-  const icon = entry.discovered ? visuals.icon : t("codex.locked.icon");
+  const iconInner = codexIconMarkup(entry, category, visuals);
 
   panel.style.setProperty("--codex-accent", visuals.accent);
 
   panel.innerHTML = `
     <div class="codex-info-layout">
-      <div class="codex-info-preview${entry.discovered ? "" : " is-locked"}">
-        <div class="codex-info-preview-top">
-          <span class="codex-info-preview-tag">${categoryLabel}</span>
-          <span class="codex-info-index">${String((entry.absoluteIndex ?? 0) + 1).padStart(2, "0")}</span>
-        </div>
-        <div class="codex-info-preview-art${entry.discovered ? "" : " codex-info-preview-art--back"}">${icon}</div>
-        <strong class="codex-info-preview-name">${name}</strong>
+      <div class="codex-info-preview${entry.discovered ? "" : " is-locked"}" data-rarity="${visuals.rarity}">
+        <span class="codex-card-index" aria-hidden="true">${String((entry.absoluteIndex ?? 0) + 1).padStart(2, "0")}</span>
+        <div class="codex-card-icon${entry.discovered ? "" : " codex-card-icon--locked"}">${iconInner}</div>
+        <p class="codex-card-name">${name}</p>
+        <p class="codex-card-kind">${categoryLabel}</p>
       </div>
       <div class="codex-info-content">
         <div class="codex-info-top">
@@ -1432,7 +1610,9 @@ function createCodexSection(title, entries, category) {
 
   const showPreview = (entry, card) => {
     const nextPanel = createCodexInfoPanel(entry, category);
+    const previewVisuals = getCodexCardVisuals(category, entry.key);
     infoPanel.innerHTML = nextPanel.innerHTML;
+    infoPanel.style.setProperty("--codex-accent", previewVisuals.accent);
     infoPanel.className = "codex-info-panel codex-info-panel--floating is-visible";
 
     requestAnimationFrame(() => {
@@ -2226,6 +2406,12 @@ function playSound(kind) {
   }
 
   const now = performance.now();
+  if (kind === "ui" && now - state.audio.lastUiAt < 72) {
+    return;
+  }
+  if (kind === "ui") {
+    state.audio.lastUiAt = now;
+  }
   if (kind === "shoot" && now - state.audio.lastShootAt < 65) {
     return;
   }
@@ -2320,6 +2506,12 @@ function playSound(kind) {
     volume = 0.045;
     duration = 0.11;
     type = "triangle";
+  } else if (kind === "ui") {
+    frequency = 920;
+    endFrequency = 1320;
+    volume = 0.034;
+    duration = 0.052;
+    type = "sine";
   }
 
   oscillator.type = type;
@@ -3080,22 +3272,35 @@ function updateSpawning(dt) {
   }
 }
 
-function spawnPickup(type, x, y, value = 0) {
-  state.pickups.push({
+function spawnPickup(type, x, y, value = 0, sourceRadius = null) {
+  const pickup = {
     type,
     x,
     y,
     value,
-    radius: type === "cache" ? 10 : 8,
     life: 20,
     magnetized: false,
-  });
+  };
+  if (type === "xp") {
+    const sr =
+      typeof sourceRadius === "number" && sourceRadius > 0 ? sourceRadius : 14;
+    const drawR = Math.min(3, Math.max(1.6, Math.min(sr - 3, sr * 0.28)));
+    pickup.drawRadius = drawR;
+    pickup.radius = Math.min(sr - 1, drawR + 1.25);
+  } else if (type === "cache") {
+    pickup.radius = 6;
+  } else if (type === "heal") {
+    pickup.radius = 6;
+  } else {
+    pickup.radius = 5;
+  }
+  state.pickups.push(pickup);
 }
 
 function handleEnemyDeath(enemy, index) {
   state.kills += 1;
   awardKillScore(enemy);
-  spawnPickup("xp", enemy.x, enemy.y, enemy.xpValue);
+  spawnPickup("xp", enemy.x, enemy.y, enemy.xpValue, enemy.radius);
 
   if (enemy.kind === "boss") {
     spawnPickup("cache", enemy.x + 26, enemy.y - 12, 1);
@@ -3478,7 +3683,7 @@ function showLevelUp() {
         hideOverlay();
       }
     },
-  })));
+  })), { levelUpKeyboard: true });
 }
 
 function showGameOverOverlay() {
@@ -3605,19 +3810,20 @@ function drawPickups(cameraX, cameraY) {
     const y = pickup.y - cameraY + canvas.height / 2;
 
     if (pickup.type === "xp") {
+      const r = typeof pickup.drawRadius === "number" ? pickup.drawRadius : 3;
       ctx.fillStyle = "#6ee9ff";
       ctx.beginPath();
-      ctx.arc(x, y, 6, 0, TAU);
+      ctx.arc(x, y, r, 0, TAU);
       ctx.fill();
       continue;
     }
 
     if (pickup.type === "heal") {
       ctx.fillStyle = "#7bff96";
-      ctx.fillRect(x - 7, y - 7, 14, 14);
+      ctx.fillRect(x - 5, y - 5, 10, 10);
       ctx.fillStyle = "#0b1020";
-      ctx.fillRect(x - 2, y - 5, 4, 10);
-      ctx.fillRect(x - 5, y - 2, 10, 4);
+      ctx.fillRect(x - 1, y - 4, 2, 8);
+      ctx.fillRect(x - 4, y - 1, 8, 2);
       continue;
     }
 
@@ -3626,15 +3832,15 @@ function drawPickups(cameraX, cameraY) {
       ctx.translate(x, y);
       ctx.rotate(Math.PI / 4);
       ctx.fillStyle = "#c08cff";
-      ctx.fillRect(-7, -7, 14, 14);
+      ctx.fillRect(-4, -4, 8, 8);
       ctx.restore();
       continue;
     }
 
     ctx.fillStyle = "#ffd27e";
-    ctx.fillRect(x - 8, y - 8, 16, 16);
+    ctx.fillRect(x - 5, y - 5, 10, 10);
     ctx.strokeStyle = "#fff1c8";
-    ctx.strokeRect(x - 8, y - 8, 16, 16);
+    ctx.strokeRect(x - 5, y - 5, 10, 10);
   }
 }
 
@@ -3975,6 +4181,32 @@ function setupTouchControls() {
 
 let lastTime = performance.now();
 
+/** 升级三选一：A/D 或左右键切换，空格确认 */
+let levelUpChoiceButtons = null;
+let levelUpChoiceIndex = 0;
+
+function clearLevelUpKeyboardNav() {
+  if (levelUpChoiceButtons) {
+    for (const b of levelUpChoiceButtons) {
+      b.classList.remove("upgrade-button--focused");
+    }
+  }
+  levelUpChoiceButtons = null;
+  levelUpChoiceIndex = 0;
+}
+
+function setLevelUpChoiceFocus(idx) {
+  if (!levelUpChoiceButtons || levelUpChoiceButtons.length === 0) {
+    return;
+  }
+  const n = levelUpChoiceButtons.length;
+  const i = ((idx % n) + n) % n;
+  levelUpChoiceIndex = i;
+  for (let j = 0; j < n; j += 1) {
+    levelUpChoiceButtons[j].classList.toggle("upgrade-button--focused", j === i);
+  }
+}
+
 function gameLoop(now) {
   const dt = Math.min(0.033, (now - lastTime) / 1000);
   lastTime = now;
@@ -4017,6 +4249,38 @@ window.addEventListener("keydown", (event) => {
       openMainMenuOverlay();
       keys.delete(key);
       return;
+    }
+    if (state.phase === "paused_settings_controls" && (key === "p" || key === "escape")) {
+      event.preventDefault();
+      showSettingsOverlay(true);
+      keys.delete(key);
+      return;
+    }
+    if (state.phase === "menu_settings_controls" && (key === "p" || key === "escape")) {
+      event.preventDefault();
+      showSettingsOverlay(false);
+      keys.delete(key);
+      return;
+    }
+    if (state.phase === "levelup" && levelUpChoiceButtons && levelUpChoiceButtons.length > 0) {
+      if (key === "a" || key === "arrowleft") {
+        event.preventDefault();
+        setLevelUpChoiceFocus(levelUpChoiceIndex - 1);
+        keys.delete(key);
+        return;
+      }
+      if (key === "d" || key === "arrowright") {
+        event.preventDefault();
+        setLevelUpChoiceFocus(levelUpChoiceIndex + 1);
+        keys.delete(key);
+        return;
+      }
+      if (event.key === " ") {
+        event.preventDefault();
+        levelUpChoiceButtons[levelUpChoiceIndex].click();
+        keys.delete(key);
+        return;
+      }
     }
   }
 

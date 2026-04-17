@@ -50,6 +50,7 @@
 | `rifle` | 穿甲步枪 | Armor-Piercing Rifle | `weapon.rifle.name` |
 | `laser` | 激光枪 | Laser | `weapon.laser.name` |
 | `plasma` | 电浆枪 | Plasma Gun | `weapon.plasma.name` |
+| `cryo` | 冷冻枪 | Cryo Gun | `weapon.cryo.name` |
 
 解锁说明文案见 `weapon.<type>.unlock`（未在表中展开）。
 
@@ -222,6 +223,7 @@
 | 霰弹枪 | `codex.weaponStats.shotgun` |
 | 激光 | `codex.weaponStats.laser` |
 | 电浆 | `codex.weaponStats.plasma` |
+| 冷冻 | `codex.weaponStats.cryo` |
 | 敌人一行 | `codex.enemyStats` |
 
 ---

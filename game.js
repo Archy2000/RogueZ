@@ -388,6 +388,27 @@ const weaponDefinitions = {
       };
     },
   },
+  cryo: {
+    maxLevel: 6,
+    getStats(level, player) {
+      return {
+        damage: (17 + (level - 1) * 5) * player.damageMultiplier,
+        cooldown: Math.max(0.44, 0.88 * Math.pow(0.93, level - 1)) / player.fireRate,
+        range: 275 + level * 22,
+        speed: 500 + level * 16,
+        projectiles: 1,
+        spread: 0.02,
+        pierce: level >= 5 ? 1 : 0,
+        size: 5 + level * 0.22,
+        color: "#c8f4ff",
+        /** 0 = 完全定身（移动倍率 0），仍可被玩家贴脸撞到受伤 */
+        slowMultiplier: 0,
+        slowDuration: 1.05 + level * 0.12,
+        cryoBlastRadius: 58 + level * 8,
+        cryoSplashDurationMul: 0.5,
+      };
+    },
+  },
 };
 
 const petDefinitions = {
@@ -712,6 +733,7 @@ const state = {
   damageTexts: [],
   dashTrailParticles: [],
   laserHitParticles: [],
+  cryoIceParticles: [],
   chainArcs: [],
   lastGameOver: null,
   combo: {
@@ -752,6 +774,8 @@ const state = {
     lastHitAt: 0,
     lastLaserHumAt: 0,
     lastPlasmaHitAt: 0,
+    lastCryoHitAt: 0,
+    lastCryoShootAt: 0,
     lastUiAt: 0,
     volume: 1,
     outputBoost: 2.35,
@@ -858,6 +882,7 @@ function resetRunState() {
   state.damageTexts = [];
   state.dashTrailParticles = [];
   state.laserHitParticles = [];
+  state.cryoIceParticles = [];
   state.chainArcs = [];
   resetCombo();
   state.player = createPlayer();
@@ -1402,6 +1427,18 @@ function buildWeaponCodexSummary(type) {
     });
   }
 
+  if (type === "cryo") {
+    const splashDur = stats.slowDuration * stats.cryoSplashDurationMul;
+    return t("codex.weaponStats.cryo", {
+      damage: formatCodexNumber(stats.damage),
+      duration: formatCodexNumber(stats.slowDuration),
+      splash: formatCodexNumber(splashDur),
+      blast: formatCodexNumber(stats.cryoBlastRadius),
+      cooldown: formatCodexNumber(stats.cooldown),
+      range: formatCodexNumber(stats.range),
+    });
+  }
+
   return t("codex.weaponStats.ballistic", {
     damage: formatCodexNumber(stats.damage),
     cooldown: formatCodexNumber(stats.cooldown),
@@ -1444,6 +1481,7 @@ function getCodexCardVisuals(category, key) {
     rifle: { accent: "#ffb2b2", icon: "AR", rarity: "standard" },
     laser: { accent: "#66ffc8", icon: "LZR", rarity: "standard" },
     plasma: { accent: "#8ef6ff", icon: "PLS", rarity: "standard" },
+    cryo: { accent: "#b8ecff", icon: "ICE", rarity: "standard" },
   };
   return map[key] || { accent: "#90a4ff", icon: "?", rarity: "standard" };
 }
@@ -1471,6 +1509,9 @@ function getCodexWeaponIconSvg(weaponType) {
   const plasma = wrap(
     `<g fill="currentColor"><rect x="6" y="18" width="7" height="9" rx="1"/><rect x="13" y="15" width="14" height="12" rx="2"/><circle cx="32" cy="21" r="5.5" opacity="0.95"/><circle cx="32" cy="21" r="2.2" fill="#fff" fill-opacity="0.35"/></g>`,
   );
+  const cryo = wrap(
+    `<g fill="currentColor"><rect x="6" y="18" width="7" height="9" rx="1"/><rect x="13" y="15" width="15" height="12" rx="2"/><path d="M30 14l1.2 2.2h2.4l-1.9 1.4.7 2.5-2-1.4-2 1.4.7-2.5-1.9-1.4h2.4z" fill-opacity="0.95"/></g>`,
+  );
 
   const map = {
     pistol,
@@ -1479,6 +1520,7 @@ function getCodexWeaponIconSvg(weaponType) {
     rifle,
     laser,
     plasma,
+    cryo,
   };
   return map[weaponType] || wrap(`<text x="20" y="24" text-anchor="middle" font-size="14" fill="currentColor">?</text>`);
 }
@@ -2399,6 +2441,76 @@ function playPlasmaHitSound(context) {
   thump.stop(start + 0.14);
 }
 
+function playCryoHitSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(state.audio.outputGainNode || context.destination);
+  master.gain.setValueAtTime(0.095, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.19);
+
+  const body = context.createOscillator();
+  const bodyGain = context.createGain();
+  body.type = "triangle";
+  body.frequency.setValueAtTime(340, start);
+  body.frequency.exponentialRampToValueAtTime(95, start + 0.14);
+  bodyGain.gain.setValueAtTime(0.52, start);
+  bodyGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.15);
+  body.connect(bodyGain);
+  bodyGain.connect(master);
+
+  const ting = context.createOscillator();
+  const tingGain = context.createGain();
+  const tingF = context.createBiquadFilter();
+  ting.type = "sine";
+  ting.frequency.setValueAtTime(1880, start);
+  ting.frequency.exponentialRampToValueAtTime(620, start + 0.045);
+  tingF.type = "bandpass";
+  tingF.frequency.setValueAtTime(1400, start);
+  tingF.Q.setValueAtTime(5.5, start);
+  tingGain.gain.setValueAtTime(0.38, start);
+  tingGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.07);
+  ting.connect(tingF);
+  tingF.connect(tingGain);
+  tingGain.connect(master);
+
+  const crack = context.createOscillator();
+  const crackGain = context.createGain();
+  crack.type = "square";
+  crack.frequency.setValueAtTime(420, start);
+  crack.frequency.exponentialRampToValueAtTime(110, start + 0.05);
+  crackGain.gain.setValueAtTime(0.11, start);
+  crackGain.gain.exponentialRampToValueAtTime(0.0001, start + 0.055);
+  crack.connect(crackGain);
+  crackGain.connect(master);
+
+  body.start(start);
+  ting.start(start + 0.002);
+  crack.start(start + 0.003);
+  body.stop(start + 0.16);
+  ting.stop(start + 0.08);
+  crack.stop(start + 0.07);
+}
+
+function playCryoShootSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(state.audio.outputGainNode || context.destination);
+  master.gain.setValueAtTime(0.055, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.1);
+
+  const o = context.createOscillator();
+  const g = context.createGain();
+  o.type = "sine";
+  o.frequency.setValueAtTime(520, start);
+  o.frequency.exponentialRampToValueAtTime(280, start + 0.08);
+  g.gain.setValueAtTime(0.42, start);
+  g.gain.exponentialRampToValueAtTime(0.0001, start + 0.09);
+  o.connect(g);
+  g.connect(master);
+  o.start(start);
+  o.stop(start + 0.1);
+}
+
 function playSound(kind) {
   const context = state.audio.context;
   if (!context || state.audio.volume <= 0) {
@@ -2421,6 +2533,12 @@ function playSound(kind) {
   if (kind === "plasmaHit" && now - state.audio.lastPlasmaHitAt < 55) {
     return;
   }
+  if (kind === "cryoHit" && now - state.audio.lastCryoHitAt < 38) {
+    return;
+  }
+  if (kind === "cryoShoot" && now - state.audio.lastCryoShootAt < 48) {
+    return;
+  }
 
   if (kind === "shoot") {
     state.audio.lastShootAt = now;
@@ -2431,6 +2549,12 @@ function playSound(kind) {
   if (kind === "plasmaHit") {
     state.audio.lastPlasmaHitAt = now;
   }
+  if (kind === "cryoHit") {
+    state.audio.lastCryoHitAt = now;
+  }
+  if (kind === "cryoShoot") {
+    state.audio.lastCryoShootAt = now;
+  }
 
   if (kind === "dash") {
     playDashSound(context);
@@ -2438,6 +2562,14 @@ function playSound(kind) {
   }
   if (kind === "plasmaHit") {
     playPlasmaHitSound(context);
+    return;
+  }
+  if (kind === "cryoHit") {
+    playCryoHitSound(context);
+    return;
+  }
+  if (kind === "cryoShoot") {
+    playCryoShootSound(context);
     return;
   }
 
@@ -2620,10 +2752,146 @@ function spawnProjectile(config) {
     chainTargets: config.chainTargets || 0,
     chainDamageFactor: config.chainDamageFactor || 0,
     chainDecay: config.chainDecay || 1,
-    slowMultiplier: config.slowMultiplier || 1,
-    slowDuration: config.slowDuration || 0,
+    slowMultiplier: typeof config.slowMultiplier === "number" ? config.slowMultiplier : 1,
+    slowDuration: typeof config.slowDuration === "number" ? config.slowDuration : 0,
+    cryoBlastRadius: config.cryoBlastRadius || 0,
+    cryoSplashDurationMul: typeof config.cryoSplashDurationMul === "number" ? config.cryoSplashDurationMul : 0.58,
     hitIds: new Set(),
   });
+}
+
+function applyCryoSplash(centerX, centerY, projectile, excludeId) {
+  const R = projectile.cryoBlastRadius || 0;
+  if (R <= 0) {
+    return;
+  }
+  const splashDur = projectile.slowDuration * (projectile.cryoSplashDurationMul ?? 0.58);
+  const mul = projectile.slowMultiplier;
+  for (const e of state.enemies) {
+    if (e.id === excludeId) {
+      continue;
+    }
+    const d = Math.hypot(e.x - centerX, e.y - centerY);
+    if (d <= R + e.radius) {
+      applySlowToEnemy(e, mul, splashDur, { skipShock: true });
+      triggerCryoFreezeVisual(e, 0.52);
+      spawnCryoIceBurst(e.x, e.y, "splash");
+    }
+  }
+}
+
+function spawnCryoDustMotes(cx, cy, radius) {
+  const maxTotal = 280;
+  if (state.cryoIceParticles.length >= maxTotal) {
+    return;
+  }
+  const n = Math.random() < 0.68 ? 1 : 2;
+  const colors = ["#f7fdff", "#dff6ff", "#c2ecff", "#a8dfff"];
+  for (let i = 0; i < n; i += 1) {
+    const ang = Math.random() * TAU;
+    const dist = radius * randomRange(0.32, 1.08);
+    const ox = cx + Math.cos(ang) * dist;
+    const oy = cy + Math.sin(ang) * dist;
+    const life = randomRange(0.52, 1.05);
+    state.cryoIceParticles.push({
+      x: ox + randomRange(-2.5, 2.5),
+      y: oy + randomRange(-2.5, 2.5),
+      vx: randomRange(-16, 16),
+      vy: randomRange(-28, 12),
+      life,
+      maxLife: life,
+      rotation: Math.random() * TAU,
+      spin: randomRange(-2.2, 2.2),
+      w: randomRange(0.65, 1.45),
+      h: randomRange(0.4, 1.05),
+      color: colors[Math.floor(Math.random() * colors.length)],
+      isDust: true,
+    });
+  }
+}
+
+function spawnCryoIceBurst(cx, cy, mode) {
+  const maxTotal = 280;
+  if (state.cryoIceParticles.length >= maxTotal) {
+    return;
+  }
+  const n = mode === "splash" ? 8 : 15;
+  const colors = ["#ffffff", "#eef8ff", "#c8f0ff", "#94d9ff"];
+  for (let i = 0; i < n; i += 1) {
+    const ang = Math.random() * TAU;
+    const spd = mode === "splash" ? randomRange(55, 190) : randomRange(85, 300);
+    const life = randomRange(0.3, 0.62);
+    state.cryoIceParticles.push({
+      x: cx + randomRange(-6, 6),
+      y: cy + randomRange(-6, 6),
+      vx: Math.cos(ang) * spd + randomRange(-50, 50),
+      vy: Math.sin(ang) * spd + randomRange(-95, 35),
+      life,
+      maxLife: life,
+      rotation: Math.random() * TAU,
+      spin: randomRange(-11, 11),
+      w: randomRange(2.2, 5),
+      h: randomRange(1.4, 3.6),
+      color: colors[Math.floor(Math.random() * colors.length)],
+    });
+  }
+}
+
+function updateCryoIceParticles(dt) {
+  for (let i = state.cryoIceParticles.length - 1; i >= 0; i -= 1) {
+    const p = state.cryoIceParticles[i];
+    const dust = p.isDust === true;
+    p.life -= dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += (dust ? 32 : 145) * dt;
+    p.rotation += p.spin * dt;
+    p.vx *= Math.pow(dust ? 0.94 : 0.88, dt * 60);
+    p.vy *= Math.pow(dust ? 0.95 : 0.9, dt * 60);
+    if (p.life <= 0) {
+      state.cryoIceParticles.splice(i, 1);
+    }
+  }
+}
+
+function drawCryoIceParticles(cameraX, cameraY) {
+  for (const p of state.cryoIceParticles) {
+    const dust = p.isDust === true;
+    const t = p.life / p.maxLife;
+    const alpha = dust ? 0.14 + t * 0.38 : 0.42 + t * 0.58;
+    const sx = p.x - cameraX + canvas.width / 2;
+    const sy = p.y - cameraY + canvas.height / 2;
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(p.rotation);
+    if (dust) {
+      ctx.fillStyle = hexToRgba(p.color, alpha);
+      ctx.beginPath();
+      ctx.moveTo(0, -p.h);
+      ctx.lineTo(p.w, 0);
+      ctx.lineTo(0, p.h);
+      ctx.lineTo(-p.w, 0);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = `rgba(255, 255, 255, ${alpha * 0.35})`;
+      ctx.beginPath();
+      ctx.arc(0, 0, Math.max(0.35, p.w * 0.22), 0, TAU);
+      ctx.fill();
+    } else {
+      ctx.fillStyle = hexToRgba(p.color, alpha);
+      ctx.beginPath();
+      ctx.moveTo(0, -p.h);
+      ctx.lineTo(p.w, 0);
+      ctx.lineTo(0, p.h);
+      ctx.lineTo(-p.w, 0);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = `rgba(255, 255, 255, ${alpha * 0.55})`;
+      ctx.lineWidth = 0.75;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
 }
 
 function distPointToSegment(px, py, x1, y1, x2, y2) {
@@ -2762,10 +3030,12 @@ function fireWeapon(weapon, stats, target) {
       chainDecay: stats.chainDecay,
       slowMultiplier: stats.slowMultiplier,
       slowDuration: stats.slowDuration,
+      cryoBlastRadius: stats.cryoBlastRadius,
+      cryoSplashDurationMul: stats.cryoSplashDurationMul,
     });
   }
 
-  playSound(weapon.type === "plasma" ? "plasma" : "shoot");
+  playSound(weapon.type === "plasma" ? "plasma" : weapon.type === "cryo" ? "cryoShoot" : "shoot");
 }
 
 function spawnDashTrailParticles(player, dt) {
@@ -2853,13 +3123,19 @@ function updateChainArcs(dt) {
   }
 }
 
-function applySlowToEnemy(enemy, slowMultiplier, slowDuration) {
+function applySlowToEnemy(enemy, slowMultiplier, slowDuration, opts = {}) {
   if (slowDuration <= 0) {
     return;
   }
   enemy.slowTimer = Math.max(enemy.slowTimer || 0, slowDuration);
   enemy.slowMultiplier = Math.min(enemy.slowMultiplier || 1, slowMultiplier);
-  enemy.shockFlash = Math.max(enemy.shockFlash || 0, 0.14);
+  if (!opts.skipShock) {
+    enemy.shockFlash = Math.max(enemy.shockFlash || 0, 0.14);
+  }
+}
+
+function triggerCryoFreezeVisual(enemy, pulse = 0.62) {
+  enemy.cryoFlash = Math.max(enemy.cryoFlash || 0, pulse);
 }
 
 function spawnChainArc(x1, y1, x2, y2, color) {
@@ -3096,6 +3372,7 @@ function createEnemy(kind, x, y) {
       tint: "#8ef7c5",
       laserFlash: 0,
       shockFlash: 0,
+      cryoFlash: 0,
       slowTimer: 0,
       slowMultiplier: 1,
       touchDamageCooldown: 0,
@@ -3119,6 +3396,7 @@ function createEnemy(kind, x, y) {
       tint: "#ffb067",
       laserFlash: 0,
       shockFlash: 0,
+      cryoFlash: 0,
       slowTimer: 0,
       slowMultiplier: 1,
       touchDamageCooldown: 0,
@@ -3142,6 +3420,7 @@ function createEnemy(kind, x, y) {
       tint: "#ff5d70",
       laserFlash: 0,
       shockFlash: 0,
+      cryoFlash: 0,
       slowTimer: 0,
       slowMultiplier: 1,
       touchDamageCooldown: 0,
@@ -3164,6 +3443,7 @@ function createEnemy(kind, x, y) {
     tint: "#9bf25a",
     laserFlash: 0,
     shockFlash: 0,
+    cryoFlash: 0,
     slowTimer: 0,
     slowMultiplier: 1,
     touchDamageCooldown: 0,
@@ -3348,8 +3628,16 @@ function updateProjectiles(dt) {
         applySlowToEnemy(enemy, projectile.slowMultiplier, projectile.slowDuration);
         spawnChainArc(projectile.x, projectile.y, enemy.x, enemy.y, projectile.color);
       }
+      if (projectile.kind === "cryo") {
+        applySlowToEnemy(enemy, projectile.slowMultiplier, projectile.slowDuration, { skipShock: true });
+        triggerCryoFreezeVisual(enemy, 0.82);
+        spawnCryoIceBurst(enemy.x, enemy.y, "direct");
+        applyCryoSplash(enemy.x, enemy.y, projectile, enemy.id);
+      }
       spawnFloatingText(enemy.x, enemy.y - enemy.radius, `-${Math.round(projectile.damage)}`, "#fff1a1");
-      playSound(projectile.kind === "plasma" ? "plasmaHit" : "hit");
+      playSound(
+        projectile.kind === "plasma" ? "plasmaHit" : projectile.kind === "cryo" ? "cryoHit" : "hit",
+      );
 
       if (projectile.kind === "plasma") {
         applyChainDamage(enemy.x, enemy.y, projectile, enemy.id);
@@ -3394,6 +3682,18 @@ function updateEnemies(dt) {
     enemy.touchDamageCooldown = Math.max(0, enemy.touchDamageCooldown - dt);
     enemy.laserFlash = Math.max(0, (enemy.laserFlash || 0) - dt);
     enemy.shockFlash = Math.max(0, (enemy.shockFlash || 0) - dt);
+    enemy.cryoFlash = Math.max(0, (enemy.cryoFlash || 0) - dt * 0.65);
+
+    const cryoRooted = enemy.slowTimer > 0 && (enemy.slowMultiplier || 1) < 0.02;
+    if (cryoRooted) {
+      enemy.cryoDustTimer = (enemy.cryoDustTimer || 0) - dt;
+      if (enemy.cryoDustTimer <= 0) {
+        enemy.cryoDustTimer = randomRange(0.62, 1.35);
+        spawnCryoDustMotes(enemy.x, enemy.y, enemy.radius);
+      }
+    } else {
+      enemy.cryoDustTimer = 0;
+    }
 
     if (enemy.kind === "boss") {
       enemy.summonTimer -= dt;
@@ -3759,6 +4059,7 @@ function update(dt) {
   updateCombo(dt);
   updateDashTrailParticles(dt);
   updateLaserHitParticles(dt);
+  updateCryoIceParticles(dt);
   updateChainArcs(dt);
   updatePet(dt);
 
@@ -3863,6 +4164,24 @@ function drawProjectiles(cameraX, cameraY) {
       ctx.restore();
       continue;
     }
+    if (projectile.kind === "cryo") {
+      ctx.save();
+      ctx.shadowBlur = 12;
+      ctx.shadowColor = hexToRgba("#a8e8ff", 0.55);
+      ctx.fillStyle = hexToRgba(projectile.color, 0.92);
+      ctx.beginPath();
+      ctx.arc(sx, sy, projectile.radius, 0, TAU);
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.75)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.fillStyle = "rgba(255, 255, 255, 0.88)";
+      ctx.beginPath();
+      ctx.arc(sx - projectile.radius * 0.25, sy - projectile.radius * 0.25, Math.max(1.4, projectile.radius * 0.35), 0, TAU);
+      ctx.fill();
+      ctx.restore();
+      continue;
+    }
     ctx.fillStyle = projectile.color;
     ctx.beginPath();
     ctx.arc(sx, sy, projectile.radius, 0, TAU);
@@ -3901,7 +4220,51 @@ function drawEnemies(cameraX, cameraY) {
       ctx.stroke();
     }
 
-    if ((enemy.slowTimer || 0) > 0) {
+    const isCryoRooted = (enemy.slowTimer || 0) > 0 && (enemy.slowMultiplier || 1) < 0.02;
+    if (isCryoRooted) {
+      const frost = Math.min(0.95, 0.38 + enemy.slowTimer * 0.22);
+      const pulse = 0.5 + 0.5 * Math.sin(state.elapsed * 8 + enemy.id);
+      ctx.fillStyle = `rgba(200, 248, 255, ${frost * 0.16})`;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius + 16, 0, TAU);
+      ctx.fill();
+
+      const grd = ctx.createRadialGradient(x, y, enemy.radius * 0.12, x, y, enemy.radius * 1.32);
+      grd.addColorStop(0, `rgba(255, 255, 255, ${frost * 0.88})`);
+      grd.addColorStop(0.35, `rgba(210, 244, 255, ${frost * 0.72})`);
+      grd.addColorStop(0.7, `rgba(140, 215, 255, ${frost * 0.48})`);
+      grd.addColorStop(1, `rgba(90, 175, 230, ${frost * 0.32})`);
+      ctx.fillStyle = grd;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius * 1.08, 0, TAU);
+      ctx.fill();
+
+      ctx.strokeStyle = `rgba(255, 255, 255, ${0.55 + pulse * 0.3})`;
+      ctx.lineWidth = 2.4;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius * 1.02, 0, TAU);
+      ctx.stroke();
+
+      ctx.strokeStyle = `rgba(255, 255, 255, ${0.4 + pulse * 0.28})`;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 6]);
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius + 6 + pulse * 2, 0, TAU);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.strokeStyle = `rgba(220, 248, 255, ${0.55 + pulse * 0.25})`;
+      ctx.lineWidth = 1.2;
+      for (let k = 0; k < 8; k += 1) {
+        const ang = (k / 8) * TAU + state.elapsed * 1.55 + enemy.id * 0.3;
+        const r0 = enemy.radius + 1;
+        const r1 = enemy.radius + 9 + pulse * 3;
+        ctx.beginPath();
+        ctx.moveTo(x + Math.cos(ang) * r0, y + Math.sin(ang) * r0);
+        ctx.lineTo(x + Math.cos(ang) * r1, y + Math.sin(ang) * r1);
+        ctx.stroke();
+      }
+    } else if ((enemy.slowTimer || 0) > 0) {
       const slowAlpha = Math.min(0.34, enemy.slowTimer * 0.14);
       ctx.fillStyle = `rgba(120, 225, 255, ${slowAlpha * 0.22})`;
       ctx.beginPath();
@@ -3925,6 +4288,24 @@ function drawEnemies(cameraX, cameraY) {
         ctx.lineTo(cx, cy);
         ctx.stroke();
       }
+    }
+
+    if ((enemy.cryoFlash || 0) > 0) {
+      const f = Math.min(1, enemy.cryoFlash / 0.82);
+      ctx.strokeStyle = `rgba(255, 255, 255, ${0.35 + f * 0.62})`;
+      ctx.lineWidth = 3 + f * 4;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius + 3 + (1 - f) * 14, 0, TAU);
+      ctx.stroke();
+      ctx.fillStyle = `rgba(240, 252, 255, ${f * 0.55})`;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius * 0.9, 0, TAU);
+      ctx.fill();
+      ctx.strokeStyle = `rgba(180, 230, 255, ${f * 0.5})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius + 10 + (1 - f) * 8, 0, TAU);
+      ctx.stroke();
     }
 
     if (enemy.kind === "boss") {
@@ -4103,6 +4484,7 @@ function draw() {
   drawEnemies(cameraX, cameraY);
   drawDashTrailParticles(cameraX, cameraY);
   drawLaserHitParticles(cameraX, cameraY);
+  drawCryoIceParticles(cameraX, cameraY);
   drawLaserBeams();
   drawPet(cameraX, cameraY);
   drawPlayer();

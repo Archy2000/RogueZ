@@ -32,7 +32,6 @@ const killsText = document.getElementById("killsText");
 const scoreText = document.getElementById("scoreText");
 const timeText = document.getElementById("timeText");
 const waveText = document.getElementById("waveText");
-const weaponText = document.getElementById("weaponText");
 const message = document.getElementById("message");
 const comboHud = document.getElementById("comboHud");
 const comboFlame = document.getElementById("comboFlame");
@@ -165,7 +164,6 @@ const hudLblKills = document.getElementById("hudLblKills");
 const hudLblScore = document.getElementById("hudLblScore");
 const hudLblTime = document.getElementById("hudLblTime");
 const hudLblWave = document.getElementById("hudLblWave");
-const hudLblWeapons = document.getElementById("hudLblWeapons");
 const hudLblCombo = document.getElementById("hudLblCombo");
 
 function applyStaticPageStrings() {
@@ -177,10 +175,6 @@ function applyStaticPageStrings() {
   const sub = document.getElementById("pageSubtitle");
   if (sub) {
     sub.textContent = t("page.subtitle");
-  }
-  const hint = document.querySelector(".touch-hint");
-  if (hint) {
-    hint.textContent = t("touch.hint");
   }
 }
 
@@ -194,6 +188,10 @@ function refreshEntityNamesForLocale() {
 }
 
 function refreshMessageBarForLocale() {
+  if (state.phase === "playing" && state.backpackOpen) {
+    message.textContent = t("backpack.msgHint");
+    return;
+  }
   switch (state.phase) {
     case "paused":
     case "paused_settings":
@@ -235,9 +233,6 @@ function refreshHudLabels() {
   }
   if (hudLblWave) {
     hudLblWave.textContent = t("hud.wave");
-  }
-  if (hudLblWeapons) {
-    hudLblWeapons.textContent = t("hud.weapons");
   }
   if (hudLblCombo) {
     hudLblCombo.textContent = t("hud.combo");
@@ -283,6 +278,9 @@ function applyLanguageToOpenOverlay() {
       showGameOverOverlay();
       break;
     default:
+      if (state.phase === "playing" && state.backpackOpen) {
+        showBackpack();
+      }
       break;
   }
 }
@@ -780,6 +778,7 @@ const state = {
     volume: 1,
     outputBoost: 2.35,
   },
+  backpackOpen: false,
 };
 
 function createWeapon(type, level = 1) {
@@ -814,6 +813,14 @@ function createPlayer() {
     damageMultiplier: 1,
     fireRate: 1,
     weapons: [createWeapon("pistol")],
+    passiveStacks: {
+      damage: 0,
+      fire: 0,
+      boots: 0,
+      med: 0,
+      regen: 0,
+      magnet: 0,
+    },
     dashTimeLeft: 0,
     dashCooldown: 0,
     dashDirX: 0,
@@ -891,6 +898,7 @@ function resetRunState() {
   state.bossSpawnedInWave = false;
   state.waveAnnouncementTimer = 2.2;
   state.nextEnemyId = 1;
+  state.backpackOpen = false;
   spawnEquippedPet();
   updateBossBar();
   updateHud();
@@ -998,6 +1006,7 @@ function showOverlay(title, text, buttons, options = {}) {
 }
 
 function hideOverlay() {
+  state.backpackOpen = false;
   clearLevelUpKeyboardNav();
   overlayCard.querySelectorAll(".codex-info-panel--floating").forEach((panel) => panel.remove());
   overlay.classList.add("hidden");
@@ -1042,6 +1051,7 @@ function pauseGame() {
     return;
   }
   ensureAudio();
+  state.backpackOpen = false;
   state.phase = "paused";
   showPauseMenu();
 }
@@ -1165,8 +1175,8 @@ function showControlsOverlay(fromPause) {
     ["controls.move", "controls.move.keys"],
     ["controls.dash", "controls.dash.keys"],
     ["controls.pause", "controls.pause.keys"],
+    ["controls.backpack", "controls.backpack.keys"],
     ["controls.menuEnter", "controls.menuEnter.keys"],
-    ["controls.touch", "controls.touch.keys"],
   ];
   for (const [actionKey, keysKey] of rows) {
     const row = document.createElement("div");
@@ -1190,6 +1200,101 @@ function showControlsOverlay(fromPause) {
   backBtn.innerHTML = `<strong>${t("controls.back.label")}</strong><span>${t("controls.back.desc")}</span>`;
   backBtn.addEventListener("click", () => showSettingsOverlay(fromPause));
   upgradeOptions.appendChild(backBtn);
+}
+
+function closeBackpack() {
+  hideOverlay();
+  if (state.phase === "playing") {
+    message.textContent = t("msg.resumeMove");
+  }
+}
+
+function showBackpack() {
+  if (state.phase !== "playing" || !state.player) {
+    return;
+  }
+  state.backpackOpen = true;
+  overlayTitle.textContent = t("backpack.title");
+  overlayText.textContent = t("backpack.hint");
+  overlay.classList.remove("hidden");
+  overlayCard.classList.remove("overlay-card--codex");
+  upgradeOptions.className = "upgrade-options upgrade-options--backpack";
+  upgradeOptions.innerHTML = "";
+
+  const root = document.createElement("div");
+  root.className = "backpack-root";
+
+  const colWeapons = document.createElement("div");
+  colWeapons.className = "backpack-col";
+  const hW = document.createElement("h3");
+  hW.className = "backpack-col-title";
+  hW.textContent = t("backpack.weapons");
+  colWeapons.appendChild(hW);
+
+  const gridW = document.createElement("div");
+  gridW.className = "backpack-weapon-grid";
+  for (const w of state.player.weapons) {
+    const vis = getCodexCardVisuals("weapons", w.type);
+    const row = document.createElement("div");
+    row.className = "backpack-weapon-row";
+    const iconWrap = document.createElement("div");
+    iconWrap.className = "backpack-weapon-icon";
+    iconWrap.style.color = vis.accent;
+    iconWrap.innerHTML = getCodexWeaponIconSvg(w.type);
+    const meta = document.createElement("div");
+    meta.className = "backpack-weapon-meta";
+    meta.innerHTML = `<strong>${weaponName(w.type)}</strong><span>${t("common.lv")}${w.level}</span>`;
+    row.appendChild(iconWrap);
+    row.appendChild(meta);
+    gridW.appendChild(row);
+  }
+  colWeapons.appendChild(gridW);
+
+  const colPass = document.createElement("div");
+  colPass.className = "backpack-col";
+  const hP = document.createElement("h3");
+  hP.className = "backpack-col-title";
+  hP.textContent = t("backpack.passives");
+  colPass.appendChild(hP);
+
+  const listP = document.createElement("div");
+  listP.className = "backpack-passive-list";
+  let anyPassive = false;
+  for (const key of PASSIVE_UPGRADE_KEYS) {
+    const n = state.player.passiveStacks[key] || 0;
+    if (n <= 0) {
+      continue;
+    }
+    anyPassive = true;
+    const row = document.createElement("div");
+    row.className = "backpack-passive-row";
+    const title = t(`upgrade.${key}.title`);
+    const desc = t(`upgrade.${key}.desc`);
+    row.innerHTML = `<div class="backpack-passive-head"><strong>${title}</strong><span class="backpack-passive-count">×${n}</span></div><div class="backpack-passive-desc">${desc}</div>`;
+    listP.appendChild(row);
+  }
+  if (!anyPassive) {
+    const empty = document.createElement("p");
+    empty.className = "backpack-empty";
+    empty.textContent = t("backpack.passivesEmpty");
+    listP.appendChild(empty);
+  }
+  colPass.appendChild(listP);
+
+  root.appendChild(colWeapons);
+  root.appendChild(colPass);
+  upgradeOptions.appendChild(root);
+
+  const closeBtn = document.createElement("button");
+  closeBtn.type = "button";
+  closeBtn.className = "upgrade-button";
+  closeBtn.innerHTML = `<strong>${t("backpack.close.label")}</strong><span>${t("backpack.close.desc")}</span>`;
+  closeBtn.addEventListener("click", () => {
+    playUiClickSound();
+    closeBackpack();
+  });
+  upgradeOptions.appendChild(closeBtn);
+  refreshMessageBarForLocale();
 }
 
 function showSettingsFromPause() {
@@ -2286,6 +2391,9 @@ function showWheelFromMenu() {
 
 function updateHud() {
   const player = state.player;
+  if (!player) {
+    return;
+  }
   hpText.textContent = `${Math.ceil(player.hp)} / ${player.maxHp}`;
   levelText.textContent = `${player.level}`;
   xpText.textContent = `${Math.floor(player.xp)} / ${player.xpToNext}`;
@@ -2293,7 +2401,6 @@ function updateHud() {
   scoreText.textContent = `${computeRunScore()}`;
   timeText.textContent = formatTime(state.elapsed);
   waveText.textContent = `${state.wave}${isBossWave(state.wave) ? ` ${t("hud.waveBoss")}` : ""}`;
-  weaponText.textContent = getWeaponSummary();
 
   const comboActive = state.combo.count > 1 && state.combo.timer > 0;
   comboHud.classList.toggle("hidden", !comboActive);
@@ -2310,6 +2417,7 @@ function updateHud() {
     comboMultText.textContent = "x1.00";
     comboFlame.dataset.tier = "0";
   }
+
 }
 
 function updateBossBar() {
@@ -2323,10 +2431,6 @@ function updateBossBar() {
   bossName.textContent = enemyDisplayName(state.boss.kind);
   bossWave.textContent = t("boss.wave", { wave: state.wave });
   bossHpFill.style.width = `${Math.max(0, (state.boss.hp / state.boss.maxHp) * 100)}%`;
-}
-
-function getWeaponSummary() {
-  return state.player.weapons.map((weapon) => `${weaponName(weapon.type)} ${t("common.lv")}${weapon.level}`).join(" / ");
 }
 
 function ensureAudio() {
@@ -3039,23 +3143,27 @@ function fireWeapon(weapon, stats, target) {
 }
 
 function spawnDashTrailParticles(player, dt) {
-  const n = Math.max(1, Math.ceil(dt * 52));
+  spawnDirectedTrailParticles(player, player.dashDirX, player.dashDirY, dt, DASH_TRAIL_COLORS, 52);
+}
+
+function spawnDirectedTrailParticles(player, dirX, dirY, dt, colors, density = 52) {
+  const n = Math.max(1, Math.ceil(dt * density));
   for (let i = 0; i < n; i += 1) {
     const back = randomRange(6, 22);
-    const perpX = -player.dashDirY;
-    const perpY = player.dashDirX;
-    const px = player.x - player.dashDirX * back + perpX * randomRange(-8, 8);
-    const py = player.y - player.dashDirY * back + perpY * randomRange(-8, 8);
+    const perpX = -dirY;
+    const perpY = dirX;
+    const px = player.x - dirX * back + perpX * randomRange(-8, 8);
+    const py = player.y - dirY * back + perpY * randomRange(-8, 8);
     const life = randomRange(0.22, 0.48);
     state.dashTrailParticles.push({
       x: px,
       y: py,
-      vx: -player.dashDirX * randomRange(35, 120) + randomRange(-28, 28),
-      vy: -player.dashDirY * randomRange(35, 120) + randomRange(-28, 28),
+      vx: -dirX * randomRange(35, 120) + randomRange(-28, 28),
+      vy: -dirY * randomRange(35, 120) + randomRange(-28, 28),
       life,
       maxLife: life,
       r: randomRange(2.2, 5.2),
-      color: DASH_TRAIL_COLORS[Math.floor(Math.random() * DASH_TRAIL_COLORS.length)],
+      color: colors[Math.floor(Math.random() * colors.length)],
     });
   }
 }
@@ -3868,6 +3976,8 @@ function gainXp(amount) {
   }
 }
 
+const PASSIVE_UPGRADE_KEYS = ["damage", "fire", "boots", "med", "regen", "magnet"];
+
 function createStatUpgradeChoices() {
   return [
     {
@@ -3875,6 +3985,7 @@ function createStatUpgradeChoices() {
       description: t("upgrade.damage.desc"),
       apply() {
         state.player.damageMultiplier *= 1.12;
+        state.player.passiveStacks.damage += 1;
       },
     },
     {
@@ -3882,6 +3993,7 @@ function createStatUpgradeChoices() {
       description: t("upgrade.fire.desc"),
       apply() {
         state.player.fireRate *= 1.1;
+        state.player.passiveStacks.fire += 1;
       },
     },
     {
@@ -3889,6 +4001,7 @@ function createStatUpgradeChoices() {
       description: t("upgrade.boots.desc"),
       apply() {
         state.player.moveSpeed += 24;
+        state.player.passiveStacks.boots += 1;
       },
     },
     {
@@ -3897,6 +4010,7 @@ function createStatUpgradeChoices() {
       apply() {
         state.player.maxHp += 18;
         state.player.hp = Math.min(state.player.maxHp, state.player.hp + 18);
+        state.player.passiveStacks.med += 1;
       },
     },
     {
@@ -3904,6 +4018,7 @@ function createStatUpgradeChoices() {
       description: t("upgrade.regen.desc"),
       apply() {
         state.player.regen += 0.35;
+        state.player.passiveStacks.regen += 1;
       },
     },
     {
@@ -3911,6 +4026,7 @@ function createStatUpgradeChoices() {
       description: t("upgrade.magnet.desc"),
       apply() {
         state.player.magnetRange += 45;
+        state.player.passiveStacks.magnet += 1;
       },
     },
   ];
@@ -3963,6 +4079,7 @@ function showLevelUp() {
   }
 
   state.pendingLevelUps -= 1;
+  state.backpackOpen = false;
   state.phase = "levelup";
   playSound("levelup");
   message.textContent = t("msg.levelUpPick");
@@ -4022,6 +4139,7 @@ function showGameOverOverlay() {
 }
 
 function triggerGameOver() {
+  state.backpackOpen = false;
   recordLeaderboardEntry();
   const finalScore = computeRunScore();
   const coinsEarned = Math.max(0, Math.floor(finalScore / COIN_CONVERSION_RATIO));
@@ -4044,6 +4162,10 @@ function triggerGameOver() {
 
 function update(dt) {
   if (state.phase !== "playing") {
+    updateFloatingTexts(dt);
+    return;
+  }
+  if (state.backpackOpen) {
     updateFloatingTexts(dt);
     return;
   }
@@ -4600,10 +4722,46 @@ function gameLoop(now) {
 window.addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();
 
+  if (event.key === " ") {
+    event.preventDefault();
+    if (state.phase === "levelup" && levelUpChoiceButtons && levelUpChoiceButtons.length > 0) {
+      if (!event.repeat) {
+        levelUpChoiceButtons[levelUpChoiceIndex].click();
+      }
+      return;
+    }
+    if (state.phase === "playing" && state.player && !state.backpackOpen) {
+      if (!event.repeat) {
+        tryStartDash();
+      }
+      return;
+    }
+    return;
+  }
+
   if (!event.repeat) {
-    if (event.key === " " && state.phase === "playing") {
+    if (state.phase === "playing" && state.backpackOpen && key === "escape") {
       event.preventDefault();
-      tryStartDash();
+      closeBackpack();
+      keys.delete(key);
+      return;
+    }
+    if (state.phase === "playing" && state.backpackOpen && key === "p") {
+      event.preventDefault();
+      closeBackpack();
+      pauseGame();
+      keys.delete(key);
+      return;
+    }
+    if (state.phase === "playing" && key === "g") {
+      event.preventDefault();
+      if (state.backpackOpen) {
+        closeBackpack();
+      } else {
+        showBackpack();
+        refreshMessageBarForLocale();
+      }
+      keys.delete(key);
       return;
     }
     if (state.phase === "playing" && (key === "p" || key === "escape")) {
@@ -4657,16 +4815,12 @@ window.addEventListener("keydown", (event) => {
         keys.delete(key);
         return;
       }
-      if (event.key === " ") {
-        event.preventDefault();
-        levelUpChoiceButtons[levelUpChoiceIndex].click();
-        keys.delete(key);
-        return;
-      }
     }
   }
 
-  keys.add(key);
+  if (event.key !== " ") {
+    keys.add(key);
+  }
   if (key === "enter" && state.phase === "menu") {
     startRun();
   }

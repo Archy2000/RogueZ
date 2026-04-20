@@ -8,6 +8,7 @@
 - **代码 ID**：武器、敌人、宠物、拾取物等内部标识符来自 [`game.js`](../game.js)（如 `weaponDefinitions`、`createEnemy`、`spawnPickup`）。
 - **未收录内容**：带 `{wave}`、`{name}` 等占位符的完整长句模板（`msg.*` 等）仅在下文「系统提示类别」概括，不逐条复制。
 - **与版本同步（重要）**：每次新增或调整**面向玩家的功能**（新武器/敌人/宠物/界面/操作说明等）、或增删改 **`i18n.js` 中的可展示名词** 时，请在本清单中**增补或修订对应表格**，避免文档与游戏脱节。若日后 `docs/` 下增加其它说明文件，同样应在同一提交或近期跟进中更新。
+- **已下线但保留设计的功能**：见 [`FEATURE_LIBRARY.md`](FEATURE_LIBRARY.md)（当前不接入 `game.js`，不收录进下表「局内升级」条目中）。
 
 ---
 
@@ -18,7 +19,6 @@
 | 被解救的僵鸽 | RogueZ · Rescued Zombie Pigeon | 副标题/品牌；`meta.title`（英文含 RogueZ 前缀） |
 | 被解救的僵鸽 | Rescued Zombie Pigeon | 页标题后缀；`page.brandSuffix` |
 | 俯视角生存肉鸽，自动锁敌射击，撑过尸潮并击败 BOSS。 | Top-down survival roguelike. Auto-aim, survive hordes, defeat the boss. | 页面说明；`page.subtitle` |
-| 触屏拖动摇杆移动，武器会自动射击 | Drag the stick to move; weapons fire automatically. | 触屏提示；`touch.hint` |
 
 ---
 
@@ -33,7 +33,7 @@
 | 分数: | Score: | `hud.score` |
 | 时间: | Time: | `hud.time` |
 | 波次: | Wave: | `hud.wave` |
-| 武器: | Weapons: | `hud.weapons` |
+| 武器: | Weapons: | `hud.weapons`（HUD 不显示武器行；战斗中 **G** 打开**背包**查看武器与可叠加强化，见 `backpack.*`） |
 | 连击: | Combo: | `hud.combo` |
 | (BOSS) | (BOSS) | `hud.waveBoss` |
 | Lv. | Lv. | `common.lv` |
@@ -161,6 +161,9 @@
 | 继续游戏 | Resume | `pause.resume.label` |
 | 主菜单 | Main menu | `pause.menu.label` |
 | 操作方式 | Controls | `settings.controls.label` / `controls.title` |
+| 背包（战斗中） | Backpack (in combat) | `controls.backpack` |
+| G 开/关 | G toggle | `controls.backpack.keys` |
+| 背包 / 本次强化等 | Backpack UI strings | `backpack.*` |
 | 简体中文 / English | 简体中文 / English | `lang.zh` / `lang.en` |
 
 ---
@@ -184,7 +187,7 @@
 | 第 {wave} 波 | Wave {wave} | `banner.wave` |
 | 第 {wave} 波 BOSS 来袭 | Wave {wave} — BOSS | `banner.bossWave` |
 | 升级选择 | Level up | `level.title` |
-| 构建你的武器组合与生存能力。 | Shape your loadout and survivability. | `level.subtitle` |
+| 构建你的武器组合与生存能力。左右或 A/D 切换，空格确认。 | Shape your loadout. ←/→ or A/D to browse, Space to pick. | `level.subtitle` |
 
 ---
 

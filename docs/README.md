@@ -7,6 +7,12 @@
 | [GLOSSARY.md](./GLOSSARY.md) | 名词中英文对照（与 `i18n.js` 同步） |
 | [ECONOMY.md](./ECONOMY.md) | 终局分数、击杀分、金币转化率与局外经济备忘 |
 
+## 文档在管什么
+
+- **[GLOSSARY.md](./GLOSSARY.md)**：给人看的「游戏里这些东西**叫什么**、**中英怎么写**」，与 [`i18n.js`](../i18n.js) 对齐；实体 ID 与 [`game.js`](../game.js) 对照。
+- **[ECONOMY.md](./ECONOMY.md)**：给人看的「**分怎么算**、**币怎么换**、和直觉是否一致」，以及转盘/商店等局外经济备忘；改 `COIN_CONVERSION_RATIO` 或终局分公式时必同步。
+- **本 README**：文档目录入口，以及「**什么时候要顺手改 docs**」的维护约定（见下节）。
+
 ## 维护约定
 
 在合并或发布前，若改动涉及以下内容，请**同步更新 `docs/` 中相应文件**（至少检查 [GLOSSARY.md](./GLOSSARY.md) 是否需改）：

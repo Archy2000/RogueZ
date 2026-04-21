@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>重置局外金币与图鉴</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 520px; margin: 48px auto; padding: 0 16px; line-height: 1.6; color: #1a2332; }
+    code { background: #eef2f8; padding: 2px 6px; border-radius: 4px; }
+    a { color: #3d5a9e; }
+  </style>
+</head>
+<body>
+  <h1>进度已清除</h1>
+  <p id="msg">正在清除本机浏览器中的存档键…</p>
+  <p><a href="index.html">返回游戏</a></p>
+  <script>
+    (function () {
+      const keys = ["rogueZMetaV1", "rogueZCodexV1"];
+      const removed = [];
+      try {
+        for (const k of keys) {
+          if (localStorage.getItem(k) !== null) {
+            localStorage.removeItem(k);
+            removed.push(k);
+          }
+        }
+        document.getElementById("msg").innerHTML =
+          removed.length === 0
+            ? "未找到已保存的金币/图鉴数据（可能已清空过）。已跳过。"
+            : "已从 <code>localStorage</code> 删除：<code>" + removed.join("</code>、<code>") + "</code>。<br>下次打开游戏时会重新从空进度开始（金币、宠物、图鉴发现记录）。";
+      } catch (e) {
+        document.getElementById("msg").textContent = "清除失败（例如浏览器禁止本地存储）：" + String(e);
+      }
+    })();
+  </script>
+</body>
+</html>

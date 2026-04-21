@@ -188,10 +188,6 @@ function refreshEntityNamesForLocale() {
 }
 
 function refreshMessageBarForLocale() {
-  if (state.phase === "playing" && state.backpackOpen) {
-    message.textContent = t("backpack.msgHint");
-    return;
-  }
   switch (state.phase) {
     case "paused":
     case "paused_settings":
@@ -278,9 +274,6 @@ function applyLanguageToOpenOverlay() {
       showGameOverOverlay();
       break;
     default:
-      if (state.phase === "playing" && state.backpackOpen) {
-        showBackpack();
-      }
       break;
   }
 }
@@ -759,6 +752,10 @@ const state = {
     equippedPet: null,
   },
   pet: null,
+  runMode: "normal",
+  trainingStalls: null,
+  trainingCages: null,
+  trainingPickupTimer: 0,
   touch: {
     active: false,
     id: null,
@@ -778,7 +775,6 @@ const state = {
     volume: 1,
     outputBoost: 2.35,
   },
-  backpackOpen: false,
 };
 
 function createWeapon(type, level = 1) {
@@ -876,7 +872,25 @@ function updateCombo(dt) {
   }
 }
 
-function resetRunState() {
+const TRAINING_STALL_INTERACT = 56;
+const TRAINING_WEAPON_LEVEL = 3;
+const TRAINING_WEAPON_RANGE_MUL = 2.1;
+
+function getPlayerWeaponStats(weaponType, level, player) {
+  const stats = weaponDefinitions[weaponType].getStats(level, player);
+  if (state.runMode !== "training" || typeof stats.range !== "number") {
+    return stats;
+  }
+  return { ...stats, range: stats.range * TRAINING_WEAPON_RANGE_MUL };
+}
+
+function resetRunState(options = {}) {
+  const training = options.training === true;
+  state.runMode = training ? "training" : "normal";
+  state.trainingStalls = null;
+  state.trainingCages = null;
+  state.trainingPickupTimer = 0;
+
   state.elapsed = 0;
   state.wave = 1;
   state.kills = 0;
@@ -896,12 +910,127 @@ function resetRunState() {
   discoverWeapon("pistol");
   state.boss = null;
   state.bossSpawnedInWave = false;
-  state.waveAnnouncementTimer = 2.2;
+  state.waveAnnouncementTimer = training ? 0 : 2.2;
   state.nextEnemyId = 1;
-  state.backpackOpen = false;
   spawnEquippedPet();
+  warmWeaponWheelSvgIcons();
+
+  if (training) {
+    initTrainingLayout();
+  }
+
   updateBossBar();
   updateHud();
+}
+
+function trainingCage(minX, minY, maxX, maxY) {
+  return { minX, minY, maxX, maxY };
+}
+
+function spawnTrainingEnemy(kind, x, y, cage) {
+  const savedWave = state.wave;
+  state.wave = 1;
+  const enemy = createEnemy(kind, x, y);
+  state.wave = savedWave;
+  enemy.cage = cage;
+  discoverEnemy(kind);
+  state.enemies.push(enemy);
+}
+
+function clampEnemyToCage(enemy) {
+  const c = enemy.cage;
+  if (!c) {
+    return;
+  }
+  enemy.x = Math.max(c.minX + enemy.radius, Math.min(c.maxX - enemy.radius, enemy.x));
+  enemy.y = Math.max(c.minY + enemy.radius, Math.min(c.maxY - enemy.radius, enemy.y));
+}
+
+function initTrainingLayout() {
+  const p = state.player;
+  p.x = 0;
+  p.y = 0;
+  p.hp = p.maxHp;
+  p.level = 1;
+  p.xp = 0;
+  p.weapons = [createWeapon("pistol", TRAINING_WEAPON_LEVEL)];
+
+  state.enemies = [];
+  state.projectiles = [];
+  state.pickups = [];
+  state.pendingLevelUps = 0;
+
+  const cageWalkers = trainingCage(-575, -500, -395, -238);
+  spawnTrainingEnemy("walker", -485, -385, cageWalkers);
+  spawnTrainingEnemy("walker", -430, -345, cageWalkers);
+
+  const cageRunner = trainingCage(-385, -500, -215, -238);
+  spawnTrainingEnemy("runner", -300, -375, cageRunner);
+
+  const cageBrute = trainingCage(-200, -508, -65, -232);
+  spawnTrainingEnemy("brute", -132, -378, cageBrute);
+
+  state.trainingCages = [cageWalkers, cageRunner, cageBrute];
+
+  const stallTypes = ["pistol", "smg", "shotgun", "rifle", "laser", "plasma", "cryo"];
+  const stallSpacing = 86;
+  const rowCenterX = -340;
+  const rowY = -155;
+  const rowStartX = rowCenterX - (stallSpacing * (stallTypes.length - 1)) / 2;
+  state.trainingStalls = stallTypes.map((type, i) => ({
+    x: rowStartX + i * stallSpacing,
+    y: rowY,
+    type,
+  }));
+}
+
+function getNearestTrainingStall() {
+  if (state.runMode !== "training" || !state.player || !state.trainingStalls) {
+    return null;
+  }
+  let best = null;
+  let bestD = Infinity;
+  for (const s of state.trainingStalls) {
+    const d = Math.hypot(state.player.x - s.x, state.player.y - s.y);
+    if (d <= TRAINING_STALL_INTERACT && d < bestD) {
+      bestD = d;
+      best = s;
+    }
+  }
+  return best;
+}
+
+function applyTrainingStallWeapon(type) {
+  if (!weaponDefinitions[type] || !state.player) {
+    return;
+  }
+  const player = state.player;
+  player.weapons = [createWeapon(type, TRAINING_WEAPON_LEVEL)];
+  discoverWeapon(type);
+  playSound("pickup");
+  state.trainingPickupTimer = 1.35;
+  message.textContent = t("training.pickup", { weapon: weaponName(type) });
+  updateHud();
+}
+
+function tryTrainingStallPickup() {
+  if (state.phase !== "playing" || state.runMode !== "training") {
+    return;
+  }
+  const stall = getNearestTrainingStall();
+  if (!stall) {
+    return;
+  }
+  applyTrainingStallWeapon(stall.type);
+}
+
+function startTrainingRun() {
+  ensureAudio();
+  resetRunState({ training: true });
+  state.phase = "playing";
+  message.textContent = t("training.msgStart");
+  hideOverlay();
+  playSound("start");
 }
 
 function spawnEquippedPet() {
@@ -1006,7 +1135,6 @@ function showOverlay(title, text, buttons, options = {}) {
 }
 
 function hideOverlay() {
-  state.backpackOpen = false;
   clearLevelUpKeyboardNav();
   overlayCard.querySelectorAll(".codex-info-panel--floating").forEach((panel) => panel.remove());
   overlay.classList.add("hidden");
@@ -1051,7 +1179,6 @@ function pauseGame() {
     return;
   }
   ensureAudio();
-  state.backpackOpen = false;
   state.phase = "paused";
   showPauseMenu();
 }
@@ -1175,8 +1302,9 @@ function showControlsOverlay(fromPause) {
     ["controls.move", "controls.move.keys"],
     ["controls.dash", "controls.dash.keys"],
     ["controls.pause", "controls.pause.keys"],
-    ["controls.backpack", "controls.backpack.keys"],
     ["controls.menuEnter", "controls.menuEnter.keys"],
+    ["controls.weaponWheel", "controls.weaponWheel.keys"],
+    ["controls.training", "controls.training.keys"],
   ];
   for (const [actionKey, keysKey] of rows) {
     const row = document.createElement("div");
@@ -1202,101 +1330,6 @@ function showControlsOverlay(fromPause) {
   upgradeOptions.appendChild(backBtn);
 }
 
-function closeBackpack() {
-  hideOverlay();
-  if (state.phase === "playing") {
-    message.textContent = t("msg.resumeMove");
-  }
-}
-
-function showBackpack() {
-  if (state.phase !== "playing" || !state.player) {
-    return;
-  }
-  state.backpackOpen = true;
-  overlayTitle.textContent = t("backpack.title");
-  overlayText.textContent = t("backpack.hint");
-  overlay.classList.remove("hidden");
-  overlayCard.classList.remove("overlay-card--codex");
-  upgradeOptions.className = "upgrade-options upgrade-options--backpack";
-  upgradeOptions.innerHTML = "";
-
-  const root = document.createElement("div");
-  root.className = "backpack-root";
-
-  const colWeapons = document.createElement("div");
-  colWeapons.className = "backpack-col";
-  const hW = document.createElement("h3");
-  hW.className = "backpack-col-title";
-  hW.textContent = t("backpack.weapons");
-  colWeapons.appendChild(hW);
-
-  const gridW = document.createElement("div");
-  gridW.className = "backpack-weapon-grid";
-  for (const w of state.player.weapons) {
-    const vis = getCodexCardVisuals("weapons", w.type);
-    const row = document.createElement("div");
-    row.className = "backpack-weapon-row";
-    const iconWrap = document.createElement("div");
-    iconWrap.className = "backpack-weapon-icon";
-    iconWrap.style.color = vis.accent;
-    iconWrap.innerHTML = getCodexWeaponIconSvg(w.type);
-    const meta = document.createElement("div");
-    meta.className = "backpack-weapon-meta";
-    meta.innerHTML = `<strong>${weaponName(w.type)}</strong><span>${t("common.lv")}${w.level}</span>`;
-    row.appendChild(iconWrap);
-    row.appendChild(meta);
-    gridW.appendChild(row);
-  }
-  colWeapons.appendChild(gridW);
-
-  const colPass = document.createElement("div");
-  colPass.className = "backpack-col";
-  const hP = document.createElement("h3");
-  hP.className = "backpack-col-title";
-  hP.textContent = t("backpack.passives");
-  colPass.appendChild(hP);
-
-  const listP = document.createElement("div");
-  listP.className = "backpack-passive-list";
-  let anyPassive = false;
-  for (const key of PASSIVE_UPGRADE_KEYS) {
-    const n = state.player.passiveStacks[key] || 0;
-    if (n <= 0) {
-      continue;
-    }
-    anyPassive = true;
-    const row = document.createElement("div");
-    row.className = "backpack-passive-row";
-    const title = t(`upgrade.${key}.title`);
-    const desc = t(`upgrade.${key}.desc`);
-    row.innerHTML = `<div class="backpack-passive-head"><strong>${title}</strong><span class="backpack-passive-count">×${n}</span></div><div class="backpack-passive-desc">${desc}</div>`;
-    listP.appendChild(row);
-  }
-  if (!anyPassive) {
-    const empty = document.createElement("p");
-    empty.className = "backpack-empty";
-    empty.textContent = t("backpack.passivesEmpty");
-    listP.appendChild(empty);
-  }
-  colPass.appendChild(listP);
-
-  root.appendChild(colWeapons);
-  root.appendChild(colPass);
-  upgradeOptions.appendChild(root);
-
-  const closeBtn = document.createElement("button");
-  closeBtn.type = "button";
-  closeBtn.className = "upgrade-button";
-  closeBtn.innerHTML = `<strong>${t("backpack.close.label")}</strong><span>${t("backpack.close.desc")}</span>`;
-  closeBtn.addEventListener("click", () => {
-    playUiClickSound();
-    closeBackpack();
-  });
-  upgradeOptions.appendChild(closeBtn);
-  refreshMessageBarForLocale();
-}
-
 function showSettingsFromPause() {
   showSettingsOverlay(true);
 }
@@ -1306,7 +1339,7 @@ function showSettingsFromMenu() {
 }
 
 function showStartMenu() {
-  resetRunState();
+  resetRunState({ training: false });
   state.phase = "menu";
   message.textContent = t("msg.menuHint");
   openMainMenuOverlay();
@@ -1314,7 +1347,7 @@ function showStartMenu() {
 
 function startRun() {
   ensureAudio();
-  resetRunState();
+  resetRunState({ training: false });
   state.phase = "playing";
   message.textContent = t("msg.wave1Start");
   hideOverlay();
@@ -1462,6 +1495,11 @@ function openMainMenuOverlay() {
       label: t("menu.start.label"),
       description: t("menu.start.desc"),
       onClick: startRun,
+    },
+    {
+      label: t("menu.training.label"),
+      description: t("menu.training.desc"),
+      onClick: startTrainingRun,
     },
     {
       label: t("menu.settings.label"),
@@ -1628,6 +1666,40 @@ function getCodexWeaponIconSvg(weaponType) {
     cryo,
   };
   return map[weaponType] || wrap(`<text x="20" y="24" text-anchor="middle" font-size="14" fill="currentColor">?</text>`);
+}
+
+const weaponWheelSvgIconImages = Object.create(null);
+
+function getWeaponWheelSvgIconImage(weaponType) {
+  let img = weaponWheelSvgIconImages[weaponType];
+  if (!img) {
+    img = new Image();
+    weaponWheelSvgIconImages[weaponType] = img;
+    const accent = getCodexCardVisuals("weapons", weaponType).accent;
+    const svg = getCodexWeaponIconSvg(weaponType).replace(/currentColor/g, accent);
+    img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  }
+  return img;
+}
+
+const weaponWheelSvgIconLight = Object.create(null);
+
+function getWeaponWheelSvgIconLight(weaponType) {
+  let img = weaponWheelSvgIconLight[weaponType];
+  if (!img) {
+    img = new Image();
+    weaponWheelSvgIconLight[weaponType] = img;
+    const svg = getCodexWeaponIconSvg(weaponType).replace(/currentColor/g, "#f2f7ff");
+    img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  }
+  return img;
+}
+
+function warmWeaponWheelSvgIcons() {
+  for (const type of Object.keys(weaponDefinitions)) {
+    getWeaponWheelSvgIconImage(type);
+    getWeaponWheelSvgIconLight(type);
+  }
 }
 
 /** SVG miniatures matching in-game enemy body colors; no HP bar (bars only appear in combat). */
@@ -2397,10 +2469,13 @@ function updateHud() {
   hpText.textContent = `${Math.ceil(player.hp)} / ${player.maxHp}`;
   levelText.textContent = `${player.level}`;
   xpText.textContent = `${Math.floor(player.xp)} / ${player.xpToNext}`;
-  killsText.textContent = `${state.kills}`;
-  scoreText.textContent = `${computeRunScore()}`;
+  killsText.textContent = state.runMode === "training" ? "—" : `${state.kills}`;
+  scoreText.textContent = state.runMode === "training" ? "—" : `${computeRunScore()}`;
   timeText.textContent = formatTime(state.elapsed);
-  waveText.textContent = `${state.wave}${isBossWave(state.wave) ? ` ${t("hud.waveBoss")}` : ""}`;
+  waveText.textContent =
+    state.runMode === "training"
+      ? t("training.hudTag")
+      : `${state.wave}${isBossWave(state.wave) ? ` ${t("hud.waveBoss")}` : ""}`;
 
   const comboActive = state.combo.count > 1 && state.combo.timer > 0;
   comboHud.classList.toggle("hidden", !comboActive);
@@ -3069,7 +3144,7 @@ function applyLaserBeamDamage(weapon, stats, dt) {
 }
 
 function updateLaserWeapon(weapon, dt, player) {
-  const stats = weaponDefinitions.laser.getStats(weapon.level, player);
+  const stats = getPlayerWeaponStats("laser", weapon.level, player);
 
   if (weapon.beamTimeLeft > 0) {
     weapon.beamTimeLeft -= dt;
@@ -3446,7 +3521,7 @@ function updatePlayer(dt) {
       continue;
     }
 
-    const stats = weaponDefinitions[weapon.type].getStats(weapon.level, player);
+    const stats = getPlayerWeaponStats(weapon.type, weapon.level, player);
     const target = getNearestEnemyInRange(stats.range);
     if (!target) {
       continue;
@@ -3686,6 +3761,16 @@ function spawnPickup(type, x, y, value = 0, sourceRadius = null) {
 }
 
 function handleEnemyDeath(enemy, index) {
+  if (state.runMode === "training" && enemy.cage) {
+    const cage = enemy.cage;
+    const kind = enemy.kind;
+    state.enemies.splice(index, 1);
+    const cx = (cage.minX + cage.maxX) / 2 + randomRange(-55, 55);
+    const cy = (cage.minY + cage.maxY) / 2 + randomRange(-40, 40);
+    spawnTrainingEnemy(kind, cx, cy, cage);
+    return;
+  }
+
   state.kills += 1;
   awardKillScore(enemy);
   spawnPickup("xp", enemy.x, enemy.y, enemy.xpValue, enemy.radius);
@@ -3785,8 +3870,24 @@ function updateEnemies(dt) {
     }
     const moveScale = enemy.slowTimer > 0 ? enemy.slowMultiplier : 1;
 
-    enemy.x += Math.cos(angle) * enemy.speed * moveScale * dt;
-    enemy.y += Math.sin(angle) * enemy.speed * moveScale * dt;
+    if (enemy.cage) {
+      enemy.trainWanderT = (enemy.trainWanderT || 0) - dt;
+      if (enemy.trainWanderT <= 0) {
+        enemy.trainWanderT = randomRange(0.85, 1.75);
+        const c = enemy.cage;
+        enemy.trainTx = randomRange(c.minX + enemy.radius + 6, c.maxX - enemy.radius - 6);
+        enemy.trainTy = randomRange(c.minY + enemy.radius + 6, c.maxY - enemy.radius - 6);
+      }
+      const tx = enemy.trainTx - enemy.x;
+      const ty = enemy.trainTy - enemy.y;
+      const len = Math.hypot(tx, ty) || 1;
+      enemy.x += (tx / len) * enemy.speed * moveScale * 0.48 * dt;
+      enemy.y += (ty / len) * enemy.speed * moveScale * 0.48 * dt;
+      clampEnemyToCage(enemy);
+    } else {
+      enemy.x += Math.cos(angle) * enemy.speed * moveScale * dt;
+      enemy.y += Math.sin(angle) * enemy.speed * moveScale * dt;
+    }
     enemy.touchDamageCooldown = Math.max(0, enemy.touchDamageCooldown - dt);
     enemy.laserFlash = Math.max(0, (enemy.laserFlash || 0) - dt);
     enemy.shockFlash = Math.max(0, (enemy.shockFlash || 0) - dt);
@@ -3818,7 +3919,11 @@ function updateEnemies(dt) {
     }
 
     const dist = Math.hypot(dx, dy);
-    if (dist <= enemy.radius + player.radius + 4 && enemy.touchDamageCooldown <= 0) {
+    if (
+      !enemy.cage
+      && dist <= enemy.radius + player.radius + 4
+      && enemy.touchDamageCooldown <= 0
+    ) {
       enemy.touchDamageCooldown = enemy.kind === "boss" ? 0.55 : 0.7;
       if (player.invulnerableTimer <= 0 && player.dashInvulnLeft <= 0) {
         player.hp -= enemy.damage;
@@ -3961,6 +4066,9 @@ function updateFloatingTexts(dt) {
 }
 
 function gainXp(amount) {
+  if (state.runMode === "training") {
+    return;
+  }
   const player = state.player;
   player.xp += amount;
 
@@ -3971,12 +4079,10 @@ function gainXp(amount) {
     state.pendingLevelUps += 1;
   }
 
-  if (state.pendingLevelUps > 0 && state.phase === "playing") {
+  if (state.pendingLevelUps > 0 && state.phase === "playing" && state.runMode !== "training") {
     showLevelUp();
   }
 }
-
-const PASSIVE_UPGRADE_KEYS = ["damage", "fire", "boots", "med", "regen", "magnet"];
 
 function createStatUpgradeChoices() {
   return [
@@ -4079,7 +4185,6 @@ function showLevelUp() {
   }
 
   state.pendingLevelUps -= 1;
-  state.backpackOpen = false;
   state.phase = "levelup";
   playSound("levelup");
   message.textContent = t("msg.levelUpPick");
@@ -4139,7 +4244,11 @@ function showGameOverOverlay() {
 }
 
 function triggerGameOver() {
-  state.backpackOpen = false;
+  if (state.runMode === "training") {
+    state.player.hp = state.player.maxHp;
+    message.textContent = t("training.reviveMsg");
+    return;
+  }
   recordLeaderboardEntry();
   const finalScore = computeRunScore();
   const coinsEarned = Math.max(0, Math.floor(finalScore / COIN_CONVERSION_RATIO));
@@ -4165,15 +4274,15 @@ function update(dt) {
     updateFloatingTexts(dt);
     return;
   }
-  if (state.backpackOpen) {
-    updateFloatingTexts(dt);
-    return;
-  }
 
   state.elapsed += dt;
-  updateWave(dt);
+  if (state.runMode !== "training") {
+    updateWave(dt);
+  }
   updatePlayer(dt);
-  updateSpawning(dt);
+  if (state.runMode !== "training") {
+    updateSpawning(dt);
+  }
   updateProjectiles(dt);
   updateEnemies(dt);
   updatePickups(dt);
@@ -4194,8 +4303,12 @@ function update(dt) {
     state.player.facing = Math.atan2(target.y - state.player.y, target.x - state.player.x);
   }
 
-  if (!target && Math.floor(state.elapsed) % 6 === 0) {
+  if (state.runMode !== "training" && !target && Math.floor(state.elapsed) % 6 === 0) {
     message.textContent = t("msg.noTargets");
+  }
+
+  if (state.runMode === "training" && (state.trainingPickupTimer || 0) > 0) {
+    state.trainingPickupTimer = Math.max(0, state.trainingPickupTimer - dt);
   }
 
   updateBossBar();
@@ -4503,17 +4616,136 @@ function drawFloatingTexts(cameraX, cameraY) {
   }
 }
 
+function drawWeaponWheel() {
+  if (state.phase !== "playing" || !state.player) {
+    return;
+  }
+  if (!keys.has("q")) {
+    return;
+  }
+
+  const player = state.player;
+  const weapons = player.weapons;
+  if (!weapons.length) {
+    return;
+  }
+
+  const WHEEL_MAX_WEAPONS = 8;
+  const list = weapons.slice(0, WHEEL_MAX_WEAPONS);
+  const n = list.length;
+
+  const px = canvas.width * 0.5;
+  const py = canvas.height * 0.5;
+  const centerAngle = -Math.PI / 2;
+  const quarter = Math.PI / 2;
+  const span = Math.min(TAU, n * quarter);
+  const ang0 = centerAngle - span / 2;
+  const rIn = player.radius + 12;
+  const rOut = Math.min(132, rIn + 58 + Math.min(n, 6) * 5);
+
+  ctx.save();
+
+  for (let i = 0; i < n; i += 1) {
+    const s0 = ang0 + (i * span) / n;
+    const s1 = ang0 + ((i + 1) * span) / n;
+    const w = list[i];
+    const vis = getCodexCardVisuals("weapons", w.type);
+
+    ctx.beginPath();
+    ctx.moveTo(px + Math.cos(s0) * rOut, py + Math.sin(s0) * rOut);
+    ctx.arc(px, py, rOut, s0, s1, false);
+    ctx.lineTo(px + Math.cos(s1) * rIn, py + Math.sin(s1) * rIn);
+    ctx.arc(px, py, rIn, s1, s0, true);
+    ctx.closePath();
+    ctx.fillStyle = hexToRgba(vis.accent, 0.52);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.22)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.14)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  const slotHalf = span / n / 2;
+  for (let i = 0; i < n; i += 1) {
+    const s0 = ang0 + (i * span) / n;
+    const s1 = ang0 + ((i + 1) * span) / n;
+    const mid = (s0 + s1) / 2;
+    const w = list[i];
+    const vis = getCodexCardVisuals("weapons", w.type);
+    const rm = rIn + (rOut - rIn) * 0.5;
+    const chord = 2 * rm * Math.sin(slotHalf);
+    const maxBox = Math.max(22, Math.min(44, chord * 0.72));
+    const ix = px + Math.cos(mid) * rm;
+    const iy = py + Math.sin(mid) * rm;
+    const lvR = rIn + (rOut - rIn) * 0.78;
+    const lvX = px + Math.cos(mid) * lvR;
+    const lvY = py + Math.sin(mid) * lvR;
+
+    const img = getWeaponWheelSvgIconLight(w.type);
+    if (img.complete && img.naturalWidth > 0) {
+      ctx.save();
+      ctx.shadowColor = "rgba(0, 0, 0, 0.45)";
+      ctx.shadowBlur = 6;
+      const iw = img.naturalWidth;
+      const ih = img.naturalHeight;
+      const scale = Math.min(maxBox / iw, maxBox / ih);
+      const dw = iw * scale;
+      const dh = ih * scale;
+      ctx.drawImage(img, ix - dw / 2, iy - dh / 2, dw, dh);
+      ctx.restore();
+    } else {
+      const label = vis.icon;
+      const fs = label.length > 3 ? 11 : label.length > 2 ? 12 : 14;
+      ctx.font = `bold ${fs}px Arial`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#f2f7ff";
+      ctx.shadowColor = "rgba(0, 0, 0, 0.55)";
+      ctx.shadowBlur = 4;
+      ctx.fillText(label, ix, iy);
+      ctx.shadowBlur = 0;
+    }
+
+    const lvStr = `${t("common.lv")}${w.level}`;
+    ctx.font = "bold 10px Arial";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const tw = ctx.measureText(lvStr).width;
+    const padX = 5;
+    const padY = 3;
+    const bx = lvX - tw / 2 - padX;
+    const by = lvY - 7;
+    const bw = tw + padX * 2;
+    const bh = 14;
+    ctx.fillStyle = "rgba(6, 10, 22, 0.55)";
+    ctx.beginPath();
+    if (typeof ctx.roundRect === "function") {
+      ctx.roundRect(bx, by, bw, bh, 5);
+    } else {
+      ctx.rect(bx, by, bw, bh);
+    }
+    ctx.fill();
+    ctx.fillStyle = "#e8f0ff";
+    ctx.fillText(lvStr, lvX, lvY);
+  }
+
+  ctx.restore();
+}
+
 function drawWeaponHints() {
   const player = state.player;
+  const rangeCap = state.runMode === "training" ? 720 : 420;
   for (const weapon of player.weapons) {
-    const stats = weaponDefinitions[weapon.type].getStats(weapon.level, player);
+    const stats = getPlayerWeaponStats(weapon.type, weapon.level, player);
     if (!stats.range) {
       continue;
     }
     ctx.strokeStyle = "rgba(135, 188, 255, 0.05)";
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.arc(canvas.width / 2, canvas.height / 2, Math.min(stats.range, 420), 0, TAU);
+    ctx.arc(canvas.width / 2, canvas.height / 2, Math.min(stats.range, rangeCap), 0, TAU);
     ctx.stroke();
   }
 }
@@ -4524,7 +4756,7 @@ function drawLaserBeams() {
     if (weapon.type !== "laser" || weapon.beamTimeLeft <= 0) {
       continue;
     }
-    const stats = weaponDefinitions.laser.getStats(weapon.level, player);
+    const stats = getPlayerWeaponStats("laser", weapon.level, player);
     const cos = Math.cos(weapon.laserAngle);
     const sin = Math.sin(weapon.laserAngle);
     const cx = canvas.width / 2;
@@ -4561,6 +4793,9 @@ function drawLaserBeams() {
 }
 
 function drawWaveBanner() {
+  if (state.runMode === "training") {
+    return;
+  }
   if (state.waveAnnouncementTimer <= 0) {
     return;
   }
@@ -4590,6 +4825,80 @@ function hexToRgba(hex, alpha) {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
+function drawTrainingArena(cameraX, cameraY) {
+  if (state.runMode !== "training" || !state.trainingCages) {
+    return;
+  }
+
+  ctx.save();
+  ctx.lineJoin = "round";
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(170, 198, 255, 0.5)";
+  ctx.setLineDash([10, 7]);
+  for (const c of state.trainingCages) {
+    const x = c.minX - cameraX + canvas.width / 2;
+    const y = c.minY - cameraY + canvas.height / 2;
+    ctx.strokeRect(x, y, c.maxX - c.minX, c.maxY - c.minY);
+  }
+  ctx.setLineDash([]);
+
+  if (state.trainingStalls) {
+    for (const s of state.trainingStalls) {
+      const x = s.x - cameraX + canvas.width / 2;
+      const y = s.y - cameraY + canvas.height / 2;
+      const vis = getCodexCardVisuals("weapons", s.type);
+      ctx.fillStyle = hexToRgba(vis.accent, 0.2);
+      ctx.strokeStyle = hexToRgba(vis.accent, 0.85);
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      if (typeof ctx.roundRect === "function") {
+        ctx.roundRect(x - 30, y - 24, 60, 48, 10);
+      } else {
+        ctx.rect(x - 30, y - 24, 60, 48);
+      }
+      ctx.fill();
+      ctx.stroke();
+
+      const img = getWeaponWheelSvgIconLight(s.type);
+      if (img.complete && img.naturalWidth > 0) {
+        const sz = 32;
+        ctx.drawImage(img, x - sz / 2, y - sz / 2 - 2, sz, sz);
+      }
+    }
+
+    const near = getNearestTrainingStall();
+    if (near) {
+      const hx = near.x - cameraX + canvas.width / 2;
+      const hy = near.y - cameraY + canvas.height / 2 - 46;
+      const keyW = 28;
+      const keyH = 26;
+      const kx = hx - keyW / 2;
+      const ky = hy - keyH / 2;
+      ctx.fillStyle = "rgba(10, 16, 32, 0.88)";
+      ctx.strokeStyle = "rgba(200, 220, 255, 0.7)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      if (typeof ctx.roundRect === "function") {
+        ctx.roundRect(kx, ky, keyW, keyH, 6);
+      } else {
+        ctx.rect(kx, ky, keyW, keyH);
+      }
+      ctx.fill();
+      ctx.stroke();
+      ctx.font = "bold 15px Arial";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#f2f7ff";
+      ctx.fillText("E", hx, hy);
+      ctx.font = "12px Arial";
+      ctx.fillStyle = "rgba(230, 240, 255, 0.95)";
+      ctx.fillText(t("training.promptPickup"), hx, hy + keyH / 2 + 14);
+    }
+  }
+
+  ctx.restore();
+}
+
 function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = "#10182c";
@@ -4599,6 +4908,9 @@ function draw() {
   const cameraY = state.player.y;
 
   drawGrid(cameraX, cameraY);
+  if (state.runMode === "training") {
+    drawTrainingArena(cameraX, cameraY);
+  }
   drawWeaponHints();
   drawPickups(cameraX, cameraY);
   drawProjectiles(cameraX, cameraY);
@@ -4612,6 +4924,7 @@ function draw() {
   drawPlayer();
   drawFloatingTexts(cameraX, cameraY);
   drawWaveBanner();
+  drawWeaponWheel();
 }
 
 function setTouchVector(clientX, clientY) {
@@ -4722,6 +5035,10 @@ function gameLoop(now) {
 window.addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();
 
+  if (key === "q" && state.phase === "playing") {
+    event.preventDefault();
+  }
+
   if (event.key === " ") {
     event.preventDefault();
     if (state.phase === "levelup" && levelUpChoiceButtons && levelUpChoiceButtons.length > 0) {
@@ -4730,7 +5047,7 @@ window.addEventListener("keydown", (event) => {
       }
       return;
     }
-    if (state.phase === "playing" && state.player && !state.backpackOpen) {
+    if (state.phase === "playing" && state.player) {
       if (!event.repeat) {
         tryStartDash();
       }
@@ -4740,27 +5057,9 @@ window.addEventListener("keydown", (event) => {
   }
 
   if (!event.repeat) {
-    if (state.phase === "playing" && state.backpackOpen && key === "escape") {
+    if (state.phase === "playing" && key === "e" && state.runMode === "training") {
       event.preventDefault();
-      closeBackpack();
-      keys.delete(key);
-      return;
-    }
-    if (state.phase === "playing" && state.backpackOpen && key === "p") {
-      event.preventDefault();
-      closeBackpack();
-      pauseGame();
-      keys.delete(key);
-      return;
-    }
-    if (state.phase === "playing" && key === "g") {
-      event.preventDefault();
-      if (state.backpackOpen) {
-        closeBackpack();
-      } else {
-        showBackpack();
-        refreshMessageBarForLocale();
-      }
+      tryTrainingStallPickup();
       keys.delete(key);
       return;
     }

@@ -300,127 +300,6 @@ body {
   margin: 0 auto;
 }
 
-.upgrade-options--backpack {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  width: min(720px, 100%);
-  margin: 0 auto;
-}
-
-.backpack-root {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
-  align-items: start;
-}
-
-@media (max-width: 560px) {
-  .backpack-root {
-    grid-template-columns: 1fr;
-  }
-}
-
-.backpack-col-title {
-  margin: 0 0 10px;
-  font-size: 15px;
-  font-weight: 700;
-  color: #e8f0ff;
-  letter-spacing: 0.02em;
-}
-
-.backpack-weapon-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.backpack-weapon-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  border: 1px solid rgba(120, 148, 200, 0.35);
-  background: rgba(18, 26, 48, 0.65);
-}
-
-.backpack-weapon-icon {
-  flex-shrink: 0;
-  width: 44px;
-  height: 44px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.backpack-weapon-icon svg {
-  width: 40px;
-  height: 40px;
-}
-
-.backpack-weapon-meta {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 0;
-}
-
-.backpack-weapon-meta strong {
-  font-size: 14px;
-  color: #f0f6ff;
-}
-
-.backpack-weapon-meta span {
-  font-size: 12px;
-  color: #9eb4dc;
-}
-
-.backpack-passive-list {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.backpack-passive-row {
-  padding: 10px 12px;
-  border-radius: 12px;
-  border: 1px solid rgba(120, 148, 200, 0.3);
-  background: rgba(18, 26, 48, 0.55);
-  text-align: left;
-}
-
-.backpack-passive-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 4px;
-}
-
-.backpack-passive-head strong {
-  font-size: 13px;
-  color: #e8f0ff;
-}
-
-.backpack-passive-count {
-  font-size: 12px;
-  color: #ffd98e;
-  font-weight: 700;
-}
-
-.backpack-passive-desc {
-  font-size: 12px;
-  line-height: 1.45;
-  color: #9eb4dc;
-}
-
-.backpack-empty {
-  margin: 0;
-  font-size: 13px;
-  color: #7a8fb0;
-}
-
 .settings-controls-wrap {
   width: 100%;
 }
@@ -439,23 +318,25 @@ body {
 
 .settings-controls-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: baseline;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 10px 14px;
+  align-items: start;
   font-size: 14px;
-  line-height: 1.35;
+  line-height: 1.4;
 }
 
 .settings-controls-action {
   color: #e8eef8;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .settings-controls-keys {
   color: #9eb4dc;
   text-align: right;
-  white-space: normal;
-  word-break: break-word;
+  word-break: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
 }
 
 .upgrade-options--leaderboard {

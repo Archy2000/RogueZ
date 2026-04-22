@@ -88,10 +88,25 @@ const COMBO_TIER_STEP = 3;
 const LEADERBOARD_KEY = "rogueZLeaderboardV1";
 const LEADERBOARD_MAX = 5;
 const CODEX_PROGRESS_KEY = "rogueZCodexV1";
+const CODEX_ENEMY_KINDS = ["walker", "runner", "brute", "hunter", "boomer", "smoker", "spitter", "charger", "witch", "boss"];
 const META_PROGRESS_KEY = "rogueZMetaV1";
 /** 终局分 → 金币：金币 = floor(finalScore / ratio)。数值越大，单局金币越少。 */
 const COIN_CONVERSION_RATIO = 20;
 const WHEEL_SPIN_COST = 80;
+/**
+ * 关卡 / 数值策划用：指定波次内，随机刷怪有概率改为从「测试池」抽 kind（只影响 pickEnemyTypeForWave）。
+ * - enabled：关则完全不生效；本地验收新怪时改为 true
+ * - targetWave：想测第几波就写几（常用 1）
+ * - chance：该波每次系统要随机一种怪时，走测试池的概率（0～1）
+ * - pool：可测的敌人 kind 列表，往数组里加字符串即可，不必再改 pickEnemyTypeForWave
+ * 对外发布或正常游玩请 enabled: false 或清空 pool。（配置名：DESIGN_DEBUG_SPAWN）
+ */
+const DESIGN_DEBUG_SPAWN = {
+  enabled: true,
+  targetWave: 1,
+  chance: 1,
+  pool: ["smoker", "spitter", "charger", "witch"],
+};
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 
 let currentLocale = "zh-CN";
@@ -587,6 +602,9 @@ const petDefinitions = {
       let best = null;
       let bestDist = Infinity;
       for (const enemy of state.enemies) {
+        if (!canPlayerDamageEnemy(enemy)) {
+          continue;
+        }
         const d = Math.hypot(enemy.x - pet.x, enemy.y - pet.y);
         if (d <= stats.range && d < bestDist) {
           best = enemy;
@@ -599,10 +617,20 @@ const petDefinitions = {
       }
       pet.zapTimer = stats.interval;
       spawnChainArc(pet.x, pet.y, best.x, best.y, this.color);
+      if (!canPlayerDamageEnemy(best)) {
+        return;
+      }
       best.hp -= stats.damage;
+      aggroWitchFromPlayerAction(best);
       applySlowToEnemy(best, stats.slowMultiplier, stats.slowDuration);
       spawnFloatingText(best.x, best.y - best.radius, `-${Math.round(stats.damage)}`, this.color);
-      playSound("plasmaHit");
+      if (best.kind === "charger") {
+        playSound("chargerHit");
+      } else if (best.kind === "witch") {
+        playSound("witchHit");
+      } else {
+        playSound("plasmaHit");
+      }
       const idx = state.enemies.indexOf(best);
       if (best.hp <= 0 && idx >= 0) {
         handleEnemyDeath(best, idx);
@@ -756,6 +784,8 @@ const state = {
   trainingStalls: null,
   trainingCages: null,
   trainingPickupTimer: 0,
+  bileSurgeTimer: 0,
+  acidPools: [],
   touch: {
     active: false,
     id: null,
@@ -772,8 +802,30 @@ const state = {
     lastCryoHitAt: 0,
     lastCryoShootAt: 0,
     lastUiAt: 0,
-    volume: 1,
-    outputBoost: 2.35,
+    lastChargerWindupAt: 0,
+    lastChargerChargeAt: 0,
+    lastChargerRamAt: 0,
+    lastChargerHitAt: 0,
+    lastChargerAttackAt: 0,
+    lastWitchAggroAt: 0,
+    lastWitchHitAt: 0,
+    lastWitchAttackAt: 0,
+    lastSmokerTetherAt: 0,
+    sfxVolume: 1,
+    bgmVolume: 1,
+    sfxBusNode: null,
+    bgmBusNode: null,
+    outputBoost: 3.05,
+  },
+  /** 程序化电子循环 BGM（非文件）；仅 phase===playing 且音量>0 时运行 */
+  proceduralBgm: {
+    active: false,
+    master: null,
+    drones: [],
+    next16th: 0,
+    step: 0,
+    noise: null,
+    bpm: 114,
   },
 };
 
@@ -822,6 +874,11 @@ function createPlayer() {
     dashDirX: 0,
     dashDirY: 0,
     dashInvulnLeft: 0,
+    hunterPinEnemyId: null,
+    hunterBreakProgress: 0,
+    boomerAcidDotCd: 0,
+    smokerTetherEnemyId: null,
+    smokerChokeCd: 0,
   };
 }
 
@@ -884,6 +941,86 @@ function getPlayerWeaponStats(weaponType, level, player) {
   return { ...stats, range: stats.range * TRAINING_WEAPON_RANGE_MUL };
 }
 
+/** Longest lock-on range among equipped weapons (ballistic + laser); used to tune Hunter pounce. */
+function getMaxPlayerWeaponRange(player) {
+  if (!player || !Array.isArray(player.weapons)) {
+    return 300;
+  }
+  let maxR = 260;
+  for (const weapon of player.weapons) {
+    const stats = getPlayerWeaponStats(weapon.type, weapon.level, player);
+    if (typeof stats.range === "number" && Number.isFinite(stats.range)) {
+      maxR = Math.max(maxR, stats.range);
+    }
+  }
+  return maxR;
+}
+
+function getActiveHunterPinEnemy(player = state.player) {
+  if (!player || player.hunterPinEnemyId == null) {
+    return null;
+  }
+  return state.enemies.find(
+    (enemy) => enemy.id === player.hunterPinEnemyId && enemy.kind === "hunter" && (enemy.hunterPinLeft || 0) > 0,
+  ) || null;
+}
+
+function isPlayerHunterPinned(player = state.player) {
+  return getActiveHunterPinEnemy(player) != null;
+}
+
+function getActiveSmokerTetherEnemy(player = state.player) {
+  if (!player || player.smokerTetherEnemyId == null) {
+    return null;
+  }
+  return state.enemies.find(
+    (e) => e.id === player.smokerTetherEnemyId && e.kind === "smoker" && (e.smokerTongueLeft || 0) > 0,
+  ) || null;
+}
+
+function releaseSmokerTongue(enemy, player) {
+  if (!enemy || enemy.kind !== "smoker") {
+    return;
+  }
+  enemy.smokerTongueLeft = 0;
+  enemy.smokerWindupLeft = 0;
+  enemy.smokerTongueCd = 2.85;
+  if (player && player.smokerTetherEnemyId === enemy.id) {
+    player.smokerTetherEnemyId = null;
+    player.smokerChokeCd = 0;
+  }
+}
+
+function canPlayerDamageEnemy(enemy) {
+  if (!enemy) {
+    return false;
+  }
+  if (enemy.kind === "hunter" && (enemy.hunterPinLeft || 0) > 0) {
+    return false;
+  }
+  return true;
+}
+
+function aggroWitchFromPlayerAction(enemy) {
+  if (!enemy || enemy.kind !== "witch" || enemy.witchAggro) {
+    return;
+  }
+  enemy.witchAggro = true;
+  enemy.damage = enemy.witchEnragedDamage;
+  enemy.speed = enemy.witchEnragedSpeed;
+  enemy.radius = enemy.witchEnragedRadius || enemy.radius;
+  enemy.tint = "#f66890";
+  message.textContent = t("msg.witchAggro");
+  playSound("witchAggro");
+}
+
+function getHunterBreakPressesLeft(player = state.player) {
+  if (!player) {
+    return 0;
+  }
+  return Math.max(0, Math.ceil((1 - (player.hunterBreakProgress || 0)) / 0.17));
+}
+
 function resetRunState(options = {}) {
   const training = options.training === true;
   state.runMode = training ? "training" : "normal";
@@ -905,6 +1042,8 @@ function resetRunState(options = {}) {
   state.laserHitParticles = [];
   state.cryoIceParticles = [];
   state.chainArcs = [];
+  state.bileSurgeTimer = 0;
+  state.acidPools = [];
   resetCombo();
   state.player = createPlayer();
   discoverWeapon("pistol");
@@ -1197,41 +1336,62 @@ function showSettingsOverlay(fromPause) {
   upgradeOptions.className = "upgrade-options upgrade-options--settings";
   upgradeOptions.innerHTML = "";
 
-  const row = document.createElement("div");
-  row.className = "settings-volume-row";
+  const volumeRows = [
+    {
+      labelKey: "settings.sfxVolume",
+      get: () => state.audio.sfxVolume,
+      set(v) {
+        state.audio.sfxVolume = v;
+      },
+      storageKey: "zombieRoguelikeSfxVolume",
+    },
+    {
+      labelKey: "settings.bgmVolume",
+      get: () => state.audio.bgmVolume,
+      set(v) {
+        state.audio.bgmVolume = v;
+      },
+      storageKey: "zombieRoguelikeBgmVolume",
+    },
+  ];
 
-  const labelTop = document.createElement("div");
-  labelTop.className = "settings-volume-label";
-  const labelText = document.createElement("span");
-  labelText.textContent = t("settings.volume");
-  const valueSpan = document.createElement("span");
-  valueSpan.className = "settings-volume-value";
-  valueSpan.textContent = `${Math.round(state.audio.volume * 100)}%`;
-  labelTop.appendChild(labelText);
-  labelTop.appendChild(valueSpan);
+  for (const vr of volumeRows) {
+    const row = document.createElement("div");
+    row.className = "settings-volume-row";
 
-  const slider = document.createElement("input");
-  slider.type = "range";
-  slider.min = "0";
-  slider.max = "100";
-  slider.value = String(Math.round(state.audio.volume * 100));
-  slider.className = "settings-volume-slider";
+    const labelTop = document.createElement("div");
+    labelTop.className = "settings-volume-label";
+    const labelText = document.createElement("span");
+    labelText.textContent = t(vr.labelKey);
+    const valueSpan = document.createElement("span");
+    valueSpan.className = "settings-volume-value";
+    valueSpan.textContent = `${Math.round(vr.get() * 100)}%`;
+    labelTop.appendChild(labelText);
+    labelTop.appendChild(valueSpan);
 
-  slider.addEventListener("input", () => {
-    const v = Number(slider.value) / 100;
-    state.audio.volume = clamp(v, 0, 1);
-    refreshAudioOutputGain();
-    valueSpan.textContent = `${Math.round(state.audio.volume * 100)}%`;
-    try {
-      localStorage.setItem("zombieRoguelikeVolume", String(state.audio.volume));
-    } catch (_) {
-      /* ignore */
-    }
-  });
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = "0";
+    slider.max = "100";
+    slider.value = String(Math.round(vr.get() * 100));
+    slider.className = "settings-volume-slider";
 
-  row.appendChild(labelTop);
-  row.appendChild(slider);
-  upgradeOptions.appendChild(row);
+    slider.addEventListener("input", () => {
+      const v = clamp(Number(slider.value) / 100, 0, 1);
+      vr.set(v);
+      refreshAudioOutputGain();
+      valueSpan.textContent = `${Math.round(v * 100)}%`;
+      try {
+        localStorage.setItem(vr.storageKey, String(v));
+      } catch (_) {
+        /* ignore */
+      }
+    });
+
+    row.appendChild(labelTop);
+    row.appendChild(slider);
+    upgradeOptions.appendChild(row);
+  }
 
   const langRow = document.createElement("div");
   langRow.className = "settings-volume-row";
@@ -1403,7 +1563,7 @@ function loadCodexProgress() {
     const weapons = Array.isArray(data.weapons) ? data.weapons : [];
     const enemies = Array.isArray(data.enemies) ? data.enemies : [];
     state.codex.discoveredWeapons = new Set(weapons.filter((type) => weaponDefinitions[type]));
-    state.codex.discoveredEnemies = new Set(enemies.filter((kind) => ["walker", "runner", "brute", "boss"].includes(kind)));
+    state.codex.discoveredEnemies = new Set(enemies.filter((kind) => CODEX_ENEMY_KINDS.includes(kind)));
   } catch (_) {
     state.codex.discoveredWeapons = new Set();
     state.codex.discoveredEnemies = new Set();
@@ -1465,7 +1625,7 @@ function discoverWeapon(type) {
 }
 
 function discoverEnemy(kind) {
-  if (!["walker", "runner", "brute", "boss"].includes(kind) || state.codex.discoveredEnemies.has(kind)) {
+  if (!CODEX_ENEMY_KINDS.includes(kind) || state.codex.discoveredEnemies.has(kind)) {
     return;
   }
   state.codex.discoveredEnemies.add(kind);
@@ -1612,6 +1772,12 @@ function getCodexCardVisuals(category, key) {
       walker: { accent: "#8fd4a0", icon: "Z", rarity: "standard" },
       runner: { accent: "#ff9b7a", icon: ">>", rarity: "standard" },
       brute: { accent: "#c4a8ff", icon: "B", rarity: "rare" },
+      hunter: { accent: "#c77dff", icon: "H", rarity: "rare" },
+      boomer: { accent: "#b8e86a", icon: "O", rarity: "rare" },
+      smoker: { accent: "#7a8fb8", icon: "S", rarity: "rare" },
+      spitter: { accent: "#8cffb4", icon: "Sp", rarity: "rare" },
+      charger: { accent: "#f4a85c", icon: "C", rarity: "rare" },
+      witch: { accent: "#d4c4f5", icon: "W", rarity: "rare" },
       boss: { accent: "#ff7a95", icon: "BOSS", rarity: "legendary" },
     };
     return map[key] || { accent: "#90a4ff", icon: "?", rarity: "standard" };
@@ -1722,10 +1888,35 @@ function getCodexEnemyIconSvg(kind) {
     "codex-enemy-icon-svg--boss",
   );
 
+  const hunter = wrap(
+    `<circle cx="20" cy="23" r="9" fill="#c77dff"/>`,
+  );
+  const boomer = wrap(
+    `<circle cx="20" cy="23" r="12" fill="#c8f070"/>`,
+  );
+  const smoker = wrap(
+    `<circle cx="20" cy="23" r="9.5" fill="#7a8fb8"/>`,
+  );
+  const spitter = wrap(
+    `<circle cx="20" cy="23" r="9" fill="#8cffb4"/>`,
+  );
+  const charger = wrap(
+    `<ellipse cx="20" cy="23" rx="11" ry="10" fill="#f4a85c"/>`,
+  );
+  const witch = wrap(
+    `<circle cx="20" cy="23" r="9" fill="#d4c4f5"/><circle cx="20" cy="18" r="3.2" fill="#2a1a38" opacity="0.55"/>`,
+  );
+
   const map = {
     walker,
     runner,
     brute,
+    hunter,
+    boomer,
+    smoker,
+    spitter,
+    charger,
+    witch,
     boss,
   };
   return map[kind] || wrap(`<circle cx="20" cy="23" r="8" fill="#90a4ff"/>`);
@@ -1888,7 +2079,7 @@ function createCodexSection(title, entries, category) {
 
 function getCodexEntries(category) {
   if (category === "enemies") {
-    return ["walker", "runner", "brute", "boss"].map((kind, index) => ({
+    return CODEX_ENEMY_KINDS.map((kind, index) => ({
       key: kind,
       category,
       ...buildEnemyCodexSummary(kind),
@@ -1936,7 +2127,7 @@ function showCodexRootFromMenu() {
   enemyCard.className = "codex-root-card";
   enemyCard.innerHTML = `<strong>${t("codex.enemies")}</strong><span>${t("codex.root.enemies.desc")}</span><small>${t("codex.collected", {
     count: state.codex.discoveredEnemies.size,
-    total: 4,
+    total: CODEX_ENEMY_KINDS.length,
   })}</small>`;
   enemyCard.addEventListener("click", () => showCodexCategoryFromMenu("enemies", 0));
   rootGrid.appendChild(enemyCard);
@@ -2514,9 +2705,14 @@ function ensureAudio() {
   }
 
   if (!state.audio.context) {
-    state.audio.context = new AudioContextClass();
-    state.audio.outputGainNode = state.audio.context.createGain();
-    state.audio.outputGainNode.connect(state.audio.context.destination);
+    const ctx = new AudioContextClass();
+    state.audio.context = ctx;
+    state.audio.outputGainNode = ctx.createGain();
+    state.audio.outputGainNode.connect(ctx.destination);
+    state.audio.sfxBusNode = ctx.createGain();
+    state.audio.sfxBusNode.connect(state.audio.outputGainNode);
+    state.audio.bgmBusNode = ctx.createGain();
+    state.audio.bgmBusNode.connect(state.audio.outputGainNode);
   }
 
   if (state.audio.context.state === "suspended") {
@@ -2526,21 +2722,224 @@ function ensureAudio() {
   refreshAudioOutputGain();
 }
 
+function getAudioSfxBus() {
+  return state.audio.sfxBusNode || state.audio.outputGainNode;
+}
+
+function getAudioBgmBus() {
+  return state.audio.bgmBusNode || state.audio.outputGainNode;
+}
+
 function refreshAudioOutputGain() {
-  if (!state.audio.outputGainNode || !state.audio.context) {
+  const ctx = state.audio.context;
+  if (!ctx || !state.audio.outputGainNode) {
+    return;
+  }
+  const t = ctx.currentTime;
+  state.audio.outputGainNode.gain.setValueAtTime(state.audio.outputBoost, t);
+  if (state.audio.sfxBusNode) {
+    state.audio.sfxBusNode.gain.setValueAtTime(state.audio.sfxVolume, t);
+  }
+  if (state.audio.bgmBusNode) {
+    state.audio.bgmBusNode.gain.setValueAtTime(state.audio.bgmVolume, t);
+  }
+}
+
+function stopProceduralBgm() {
+  const bgm = state.proceduralBgm;
+  if (!bgm) {
+    return;
+  }
+  for (const d of bgm.drones) {
+    try {
+      d.o.stop();
+    } catch (_) {
+      /* ignore */
+    }
+    try {
+      d.o.disconnect();
+      d.g.disconnect();
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  bgm.drones = [];
+  if (bgm.master) {
+    try {
+      bgm.master.disconnect();
+    } catch (_) {
+      /* ignore */
+    }
+    bgm.master = null;
+  }
+  bgm.active = false;
+  bgm.next16th = 0;
+  bgm.step = 0;
+}
+
+function ensureBgmNoiseBuffer(ctx) {
+  const bgm = state.proceduralBgm;
+  if (bgm.noise) {
+    return;
+  }
+  const len = Math.ceil(ctx.sampleRate * 0.18);
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < len; i += 1) {
+    ch[i] = Math.random() * 2 - 1;
+  }
+  bgm.noise = buf;
+}
+
+function scheduleBgmKick(ctx, t, out) {
+  const o = ctx.createOscillator();
+  const g = ctx.createGain();
+  o.type = "sine";
+  o.frequency.setValueAtTime(168, t);
+  o.frequency.exponentialRampToValueAtTime(48, t + 0.085);
+  g.gain.setValueAtTime(0.38, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+  o.connect(g);
+  g.connect(out);
+  o.start(t);
+  o.stop(t + 0.15);
+}
+
+function scheduleBgmHat(ctx, t, out, open) {
+  const bgm = state.proceduralBgm;
+  const src = ctx.createBufferSource();
+  src.buffer = bgm.noise;
+  const bp = ctx.createBiquadFilter();
+  bp.type = "bandpass";
+  bp.frequency.setValueAtTime(open ? 7600 : 5400, t);
+  bp.Q.setValueAtTime(open ? 0.75 : 1.35, t);
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(open ? 0.07 : 0.05, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + (open ? 0.12 : 0.055));
+  src.connect(bp);
+  bp.connect(g);
+  g.connect(out);
+  src.start(t);
+  src.stop(t + (open ? 0.13 : 0.06));
+}
+
+function scheduleBgmBass(ctx, t, out, freq, dur) {
+  const o = ctx.createOscillator();
+  const g = ctx.createGain();
+  o.type = "triangle";
+  o.frequency.setValueAtTime(freq, t);
+  o.frequency.exponentialRampToValueAtTime(freq * 0.92, t + dur);
+  g.gain.setValueAtTime(0.22, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.02);
+  o.connect(g);
+  g.connect(out);
+  o.start(t);
+  o.stop(t + dur + 0.03);
+}
+
+function scheduleBgmPluck(ctx, t, out, freq) {
+  const o = ctx.createOscillator();
+  const g = ctx.createGain();
+  o.type = "sine";
+  o.frequency.setValueAtTime(freq * 1.02, t);
+  o.frequency.exponentialRampToValueAtTime(freq * 0.5, t + 0.055);
+  g.gain.setValueAtTime(0.065, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
+  o.connect(g);
+  g.connect(out);
+  o.start(t);
+  o.stop(t + 0.085);
+}
+
+function startProceduralBgmDrone(ctx, out) {
+  const bgm = state.proceduralBgm;
+  const roots = [49, 73.5, 98];
+  for (let i = 0; i < roots.length; i += 1) {
+    const f = roots[i];
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = "sine";
+    o.frequency.value = f * (1 + (i - 1) * 0.0012);
+    g.gain.value = 0.055 + i * 0.018;
+    o.connect(g);
+    g.connect(out);
+    o.start();
+    bgm.drones.push({ o, g });
+  }
+}
+
+function syncProceduralBgm() {
+  if (!AudioContextClass) {
+    return;
+  }
+  const bgm = state.proceduralBgm;
+  const phaseOk = state.phase === "playing";
+  const volOk = state.audio.bgmVolume > 0.001;
+
+  if (!phaseOk || !volOk) {
+    if (bgm.active) {
+      stopProceduralBgm();
+    }
     return;
   }
 
-  state.audio.outputGainNode.gain.setValueAtTime(
-    state.audio.volume * state.audio.outputBoost,
-    state.audio.context.currentTime
-  );
+  ensureAudio();
+  const ctx = state.audio.context;
+  if (!ctx || !getAudioBgmBus()) {
+    return;
+  }
+
+  if (!bgm.active) {
+    bgm.master = ctx.createGain();
+    bgm.master.gain.value = 0.045;
+    bgm.master.connect(getAudioBgmBus());
+    ensureBgmNoiseBuffer(ctx);
+    startProceduralBgmDrone(ctx, bgm.master);
+    bgm.next16th = ctx.currentTime + 0.06;
+    bgm.step = 0;
+    bgm.active = true;
+  }
+
+  const b16 = 60 / bgm.bpm / 4;
+  const ahead = 0.5;
+  const arp = [196, 233, 262, 294, 311, 294, 262, 233, 196, 233, 311, 294, 262, 233, 196, 262];
+
+  while (bgm.next16th < ctx.currentTime + ahead) {
+    const t = bgm.next16th;
+    const s = bgm.step % 16;
+
+    if (s % 4 === 0) {
+      scheduleBgmKick(ctx, t, bgm.master);
+    }
+    if (s === 7 || s === 15) {
+      scheduleBgmHat(ctx, t, bgm.master, true);
+    } else if (s % 2 === 1) {
+      scheduleBgmHat(ctx, t, bgm.master, false);
+    }
+
+    if (s === 0) {
+      scheduleBgmBass(ctx, t, bgm.master, 55, 0.14);
+    } else if (s === 6) {
+      scheduleBgmBass(ctx, t, bgm.master, 73.42, 0.11);
+    } else if (s === 10) {
+      scheduleBgmBass(ctx, t, bgm.master, 55, 0.1);
+    } else if (s === 13) {
+      scheduleBgmBass(ctx, t, bgm.master, 65.41, 0.12);
+    }
+
+    if (s % 2 === 0) {
+      scheduleBgmPluck(ctx, t + b16 * 0.06, bgm.master, arp[s]);
+    }
+
+    bgm.next16th += b16;
+    bgm.step += 1;
+  }
 }
 
 function playDashSound(context) {
   const start = context.currentTime;
   const master = context.createGain();
-  master.connect(state.audio.outputGainNode || context.destination);
+  master.connect(getAudioSfxBus() || context.destination);
 
   master.gain.setValueAtTime(0.13, start);
   master.gain.exponentialRampToValueAtTime(0.0001, start + 0.2);
@@ -2574,7 +2973,7 @@ function playDashSound(context) {
 function playPlasmaHitSound(context) {
   const start = context.currentTime;
   const master = context.createGain();
-  master.connect(state.audio.outputGainNode || context.destination);
+  master.connect(getAudioSfxBus() || context.destination);
   master.gain.setValueAtTime(0.085, start);
   master.gain.exponentialRampToValueAtTime(0.0001, start + 0.16);
 
@@ -2623,7 +3022,7 @@ function playPlasmaHitSound(context) {
 function playCryoHitSound(context) {
   const start = context.currentTime;
   const master = context.createGain();
-  master.connect(state.audio.outputGainNode || context.destination);
+  master.connect(getAudioSfxBus() || context.destination);
   master.gain.setValueAtTime(0.095, start);
   master.gain.exponentialRampToValueAtTime(0.0001, start + 0.19);
 
@@ -2673,7 +3072,7 @@ function playCryoHitSound(context) {
 function playCryoShootSound(context) {
   const start = context.currentTime;
   const master = context.createGain();
-  master.connect(state.audio.outputGainNode || context.destination);
+  master.connect(getAudioSfxBus() || context.destination);
   master.gain.setValueAtTime(0.055, start);
   master.gain.exponentialRampToValueAtTime(0.0001, start + 0.1);
 
@@ -2690,9 +3089,305 @@ function playCryoShootSound(context) {
   o.stop(start + 0.1);
 }
 
+function playChargerWindupSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(getAudioSfxBus() || context.destination);
+  master.gain.setValueAtTime(0.1, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.26);
+  const rumble = context.createOscillator();
+  const rumbleG = context.createGain();
+  rumble.type = "sawtooth";
+  rumble.frequency.setValueAtTime(88, start);
+  rumble.frequency.exponentialRampToValueAtTime(158, start + 0.2);
+  rumbleG.gain.setValueAtTime(0.48, start);
+  rumbleG.gain.exponentialRampToValueAtTime(0.0001, start + 0.22);
+  rumble.connect(rumbleG);
+  rumbleG.connect(master);
+  const tick = context.createOscillator();
+  const tickG = context.createGain();
+  tick.type = "square";
+  tick.frequency.setValueAtTime(210, start);
+  tick.frequency.exponentialRampToValueAtTime(95, start + 0.18);
+  tickG.gain.setValueAtTime(0.06, start);
+  tickG.gain.exponentialRampToValueAtTime(0.0001, start + 0.19);
+  tick.connect(tickG);
+  tickG.connect(master);
+  rumble.start(start);
+  tick.start(start + 0.02);
+  rumble.stop(start + 0.24);
+  tick.stop(start + 0.22);
+}
+
+function playChargerChargeSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(getAudioSfxBus() || context.destination);
+  master.gain.setValueAtTime(0.125, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.28);
+  const low = context.createOscillator();
+  const lowG = context.createGain();
+  low.type = "sawtooth";
+  low.frequency.setValueAtTime(130, start);
+  low.frequency.exponentialRampToValueAtTime(420, start + 0.14);
+  lowG.gain.setValueAtTime(0.72, start);
+  lowG.gain.exponentialRampToValueAtTime(0.0001, start + 0.2);
+  low.connect(lowG);
+  lowG.connect(master);
+  const hi = context.createOscillator();
+  const hiG = context.createGain();
+  hi.type = "triangle";
+  hi.frequency.setValueAtTime(380, start);
+  hi.frequency.exponentialRampToValueAtTime(920, start + 0.1);
+  hiG.gain.setValueAtTime(0.38, start);
+  hiG.gain.exponentialRampToValueAtTime(0.0001, start + 0.14);
+  hi.connect(hiG);
+  hiG.connect(master);
+  low.start(start);
+  hi.start(start);
+  low.stop(start + 0.22);
+  hi.stop(start + 0.16);
+}
+
+function playChargerRamSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(getAudioSfxBus() || context.destination);
+  master.gain.setValueAtTime(0.14, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.32);
+  const slam = context.createOscillator();
+  const slamG = context.createGain();
+  slam.type = "sine";
+  slam.frequency.setValueAtTime(165, start);
+  slam.frequency.exponentialRampToValueAtTime(48, start + 0.22);
+  slamG.gain.setValueAtTime(0.62, start);
+  slamG.gain.exponentialRampToValueAtTime(0.0001, start + 0.24);
+  slam.connect(slamG);
+  slamG.connect(master);
+  const crack = context.createOscillator();
+  const crackG = context.createGain();
+  crack.type = "square";
+  crack.frequency.setValueAtTime(420, start);
+  crack.frequency.exponentialRampToValueAtTime(1200, start + 0.04);
+  crackG.gain.setValueAtTime(0.22, start);
+  crackG.gain.exponentialRampToValueAtTime(0.0001, start + 0.06);
+  crack.connect(crackG);
+  crackG.connect(master);
+  slam.start(start);
+  crack.start(start + 0.002);
+  slam.stop(start + 0.26);
+  crack.stop(start + 0.07);
+}
+
+function playChargerHitSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(getAudioSfxBus() || context.destination);
+  master.gain.setValueAtTime(0.09, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.14);
+  const plate = context.createOscillator();
+  const plateG = context.createGain();
+  const plateF = context.createBiquadFilter();
+  plate.type = "triangle";
+  plate.frequency.setValueAtTime(240, start);
+  plate.frequency.exponentialRampToValueAtTime(110, start + 0.1);
+  plateF.type = "bandpass";
+  plateF.frequency.setValueAtTime(320, start);
+  plateF.Q.setValueAtTime(3.2, start);
+  plateG.gain.setValueAtTime(0.5, start);
+  plateG.gain.exponentialRampToValueAtTime(0.0001, start + 0.12);
+  plate.connect(plateF);
+  plateF.connect(plateG);
+  plateG.connect(master);
+  const ring = context.createOscillator();
+  const ringG = context.createGain();
+  ring.type = "sine";
+  ring.frequency.setValueAtTime(380, start);
+  ring.frequency.exponentialRampToValueAtTime(220, start + 0.08);
+  ringG.gain.setValueAtTime(0.2, start);
+  ringG.gain.exponentialRampToValueAtTime(0.0001, start + 0.09);
+  ring.connect(ringG);
+  ringG.connect(master);
+  plate.start(start);
+  ring.start(start + 0.004);
+  plate.stop(start + 0.13);
+  ring.stop(start + 0.1);
+}
+
+function playChargerAttackSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(getAudioSfxBus() || context.destination);
+  master.gain.setValueAtTime(0.065, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.1);
+  const o = context.createOscillator();
+  const g = context.createGain();
+  o.type = "triangle";
+  o.frequency.setValueAtTime(155, start);
+  o.frequency.exponentialRampToValueAtTime(88, start + 0.08);
+  g.gain.setValueAtTime(0.55, start);
+  g.gain.exponentialRampToValueAtTime(0.0001, start + 0.09);
+  o.connect(g);
+  g.connect(master);
+  o.start(start);
+  o.stop(start + 0.1);
+}
+
+function playWitchAggroSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(getAudioSfxBus() || context.destination);
+  master.gain.setValueAtTime(0.1, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.34);
+  const wail = context.createOscillator();
+  const wailG = context.createGain();
+  wail.type = "sine";
+  wail.frequency.setValueAtTime(480, start);
+  wail.frequency.exponentialRampToValueAtTime(2100, start + 0.12);
+  wailG.gain.setValueAtTime(0.42, start);
+  wailG.gain.exponentialRampToValueAtTime(0.0001, start + 0.28);
+  wail.connect(wailG);
+  wailG.connect(master);
+  const grit = context.createOscillator();
+  const gritG = context.createGain();
+  grit.type = "sawtooth";
+  grit.frequency.setValueAtTime(620, start);
+  grit.frequency.exponentialRampToValueAtTime(140, start + 0.16);
+  gritG.gain.setValueAtTime(0.12, start);
+  gritG.gain.exponentialRampToValueAtTime(0.0001, start + 0.18);
+  grit.connect(gritG);
+  gritG.connect(master);
+  wail.start(start);
+  grit.start(start + 0.015);
+  wail.stop(start + 0.3);
+  grit.stop(start + 0.2);
+}
+
+function playWitchHitSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(getAudioSfxBus() || context.destination);
+  master.gain.setValueAtTime(0.078, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.15);
+  const airy = context.createOscillator();
+  const airyG = context.createGain();
+  const airyF = context.createBiquadFilter();
+  airy.type = "triangle";
+  airy.frequency.setValueAtTime(1020, start);
+  airy.frequency.exponentialRampToValueAtTime(420, start + 0.1);
+  airyF.type = "highpass";
+  airyF.frequency.setValueAtTime(380, start);
+  airyG.gain.setValueAtTime(0.35, start);
+  airyG.gain.exponentialRampToValueAtTime(0.0001, start + 0.12);
+  airy.connect(airyF);
+  airyF.connect(airyG);
+  airyG.connect(master);
+  const thud = context.createOscillator();
+  const thudG = context.createGain();
+  thud.type = "sine";
+  thud.frequency.setValueAtTime(200, start);
+  thud.frequency.exponentialRampToValueAtTime(95, start + 0.09);
+  thudG.gain.setValueAtTime(0.28, start);
+  thudG.gain.exponentialRampToValueAtTime(0.0001, start + 0.1);
+  thud.connect(thudG);
+  thudG.connect(master);
+  airy.start(start);
+  thud.start(start + 0.003);
+  airy.stop(start + 0.13);
+  thud.stop(start + 0.11);
+}
+
+function playWitchAttackSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(getAudioSfxBus() || context.destination);
+  master.gain.setValueAtTime(0.072, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.11);
+  const slash = context.createOscillator();
+  const slashG = context.createGain();
+  slash.type = "sawtooth";
+  slash.frequency.setValueAtTime(340, start);
+  slash.frequency.exponentialRampToValueAtTime(720, start + 0.05);
+  slashG.gain.setValueAtTime(0.38, start);
+  slashG.gain.exponentialRampToValueAtTime(0.0001, start + 0.07);
+  slash.connect(slashG);
+  slashG.connect(master);
+  const snap = context.createOscillator();
+  const snapG = context.createGain();
+  snap.type = "square";
+  snap.frequency.setValueAtTime(880, start);
+  snap.frequency.exponentialRampToValueAtTime(2200, start + 0.025);
+  snapG.gain.setValueAtTime(0.08, start);
+  snapG.gain.exponentialRampToValueAtTime(0.0001, start + 0.04);
+  snap.connect(snapG);
+  snapG.connect(master);
+  slash.start(start);
+  snap.start(start + 0.008);
+  slash.stop(start + 0.09);
+  snap.stop(start + 0.05);
+}
+
+function playSmokerTetherSound(context) {
+  const start = context.currentTime;
+  const master = context.createGain();
+  master.connect(getAudioSfxBus() || context.destination);
+  master.gain.setValueAtTime(0.095, start);
+  master.gain.exponentialRampToValueAtTime(0.0001, start + 0.28);
+  const whip = context.createOscillator();
+  const whipG = context.createGain();
+  whip.type = "triangle";
+  whip.frequency.setValueAtTime(185, start);
+  whip.frequency.exponentialRampToValueAtTime(720, start + 0.07);
+  whipG.gain.setValueAtTime(0.48, start);
+  whipG.gain.exponentialRampToValueAtTime(0.0001, start + 0.12);
+  whip.connect(whipG);
+  whipG.connect(master);
+  const suck = context.createOscillator();
+  const suckG = context.createGain();
+  const suckF = context.createBiquadFilter();
+  suck.type = "sawtooth";
+  suck.frequency.setValueAtTime(95, start);
+  suck.frequency.exponentialRampToValueAtTime(48, start + 0.2);
+  suckF.type = "lowpass";
+  suckF.frequency.setValueAtTime(420, start);
+  suckF.frequency.exponentialRampToValueAtTime(140, start + 0.18);
+  suckG.gain.setValueAtTime(0.32, start);
+  suckG.gain.exponentialRampToValueAtTime(0.0001, start + 0.22);
+  suck.connect(suckF);
+  suckF.connect(suckG);
+  suckG.connect(master);
+  const tick = context.createOscillator();
+  const tickG = context.createGain();
+  tick.type = "square";
+  tick.frequency.setValueAtTime(1100, start);
+  tick.frequency.exponentialRampToValueAtTime(320, start + 0.04);
+  tickG.gain.setValueAtTime(0.07, start);
+  tickG.gain.exponentialRampToValueAtTime(0.0001, start + 0.045);
+  tick.connect(tickG);
+  tickG.connect(master);
+  whip.start(start);
+  suck.start(start + 0.012);
+  tick.start(start);
+  whip.stop(start + 0.13);
+  suck.stop(start + 0.24);
+  tick.stop(start + 0.05);
+}
+
+function playProjectileHitOnEnemy(enemy, projectileKind) {
+  if (enemy.kind === "charger") {
+    playSound("chargerHit");
+    return;
+  }
+  if (enemy.kind === "witch") {
+    playSound("witchHit");
+    return;
+  }
+  playSound(projectileKind === "plasma" ? "plasmaHit" : projectileKind === "cryo" ? "cryoHit" : "hit");
+}
+
 function playSound(kind) {
   const context = state.audio.context;
-  if (!context || state.audio.volume <= 0) {
+  if (!context || state.audio.sfxVolume <= 0) {
     return;
   }
 
@@ -2718,6 +3413,33 @@ function playSound(kind) {
   if (kind === "cryoShoot" && now - state.audio.lastCryoShootAt < 48) {
     return;
   }
+  if (kind === "chargerWindup" && now - state.audio.lastChargerWindupAt < 320) {
+    return;
+  }
+  if (kind === "chargerCharge" && now - state.audio.lastChargerChargeAt < 220) {
+    return;
+  }
+  if (kind === "chargerRam" && now - state.audio.lastChargerRamAt < 140) {
+    return;
+  }
+  if (kind === "chargerHit" && now - state.audio.lastChargerHitAt < 52) {
+    return;
+  }
+  if (kind === "chargerAttack" && now - state.audio.lastChargerAttackAt < 220) {
+    return;
+  }
+  if (kind === "witchAggro" && now - state.audio.lastWitchAggroAt < 380) {
+    return;
+  }
+  if (kind === "witchHit" && now - state.audio.lastWitchHitAt < 52) {
+    return;
+  }
+  if (kind === "witchAttack" && now - state.audio.lastWitchAttackAt < 200) {
+    return;
+  }
+  if (kind === "smokerTether" && now - state.audio.lastSmokerTetherAt < 380) {
+    return;
+  }
 
   if (kind === "shoot") {
     state.audio.lastShootAt = now;
@@ -2733,6 +3455,33 @@ function playSound(kind) {
   }
   if (kind === "cryoShoot") {
     state.audio.lastCryoShootAt = now;
+  }
+  if (kind === "chargerWindup") {
+    state.audio.lastChargerWindupAt = now;
+  }
+  if (kind === "chargerCharge") {
+    state.audio.lastChargerChargeAt = now;
+  }
+  if (kind === "chargerRam") {
+    state.audio.lastChargerRamAt = now;
+  }
+  if (kind === "chargerHit") {
+    state.audio.lastChargerHitAt = now;
+  }
+  if (kind === "chargerAttack") {
+    state.audio.lastChargerAttackAt = now;
+  }
+  if (kind === "witchAggro") {
+    state.audio.lastWitchAggroAt = now;
+  }
+  if (kind === "witchHit") {
+    state.audio.lastWitchHitAt = now;
+  }
+  if (kind === "witchAttack") {
+    state.audio.lastWitchAttackAt = now;
+  }
+  if (kind === "smokerTether") {
+    state.audio.lastSmokerTetherAt = now;
   }
 
   if (kind === "dash") {
@@ -2751,11 +3500,47 @@ function playSound(kind) {
     playCryoShootSound(context);
     return;
   }
+  if (kind === "chargerWindup") {
+    playChargerWindupSound(context);
+    return;
+  }
+  if (kind === "chargerCharge") {
+    playChargerChargeSound(context);
+    return;
+  }
+  if (kind === "chargerRam") {
+    playChargerRamSound(context);
+    return;
+  }
+  if (kind === "chargerHit") {
+    playChargerHitSound(context);
+    return;
+  }
+  if (kind === "chargerAttack") {
+    playChargerAttackSound(context);
+    return;
+  }
+  if (kind === "witchAggro") {
+    playWitchAggroSound(context);
+    return;
+  }
+  if (kind === "witchHit") {
+    playWitchHitSound(context);
+    return;
+  }
+  if (kind === "witchAttack") {
+    playWitchAttackSound(context);
+    return;
+  }
+  if (kind === "smokerTether") {
+    playSmokerTetherSound(context);
+    return;
+  }
 
   const oscillator = context.createOscillator();
   const gainNode = context.createGain();
   oscillator.connect(gainNode);
-  gainNode.connect(state.audio.outputGainNode || context.destination);
+  gainNode.connect(getAudioSfxBus() || context.destination);
 
   let frequency = 220;
   let endFrequency = frequency;
@@ -2844,16 +3629,33 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-(function loadPersistedVolume() {
+(function loadPersistedAudioLevels() {
   try {
-    const raw = localStorage.getItem("zombieRoguelikeVolume");
-    if (raw !== null) {
-      const n = Number.parseFloat(raw);
+    const rawSfx = localStorage.getItem("zombieRoguelikeSfxVolume");
+    const rawBgm = localStorage.getItem("zombieRoguelikeBgmVolume");
+    if (rawSfx !== null) {
+      const n = Number.parseFloat(rawSfx);
       if (Number.isFinite(n)) {
-        state.audio.volume = clamp(n, 0, 1);
+        state.audio.sfxVolume = clamp(n, 0, 1);
       }
     }
-
+    if (rawBgm !== null) {
+      const n = Number.parseFloat(rawBgm);
+      if (Number.isFinite(n)) {
+        state.audio.bgmVolume = clamp(n, 0, 1);
+      }
+    }
+    if (rawSfx === null && rawBgm === null) {
+      const legacy = localStorage.getItem("zombieRoguelikeVolume");
+      if (legacy !== null) {
+        const n = Number.parseFloat(legacy);
+        if (Number.isFinite(n)) {
+          const v = clamp(n, 0, 1);
+          state.audio.sfxVolume = v;
+          state.audio.bgmVolume = v;
+        }
+      }
+    }
   } catch (_) {
     /* ignore */
   }
@@ -2903,6 +3705,9 @@ function getNearestEnemyInRange(range) {
   let bestDist = Infinity;
 
   for (const enemy of state.enemies) {
+    if (!canPlayerDamageEnemy(enemy)) {
+      continue;
+    }
     const dx = enemy.x - player.x;
     const dy = enemy.y - player.y;
     const dist = Math.hypot(dx, dy);
@@ -3087,11 +3892,73 @@ function distPointToSegment(px, py, x1, y1, x2, y2) {
   return Math.hypot(px - nx, py - ny);
 }
 
+/** 冲撞路径上的非 BOSS 僵尸：撞开 + 短时减速；对 boss 无效。 */
+function applyChargerStampedeCollisionOthers(charger, prevX, prevY, stepLen, moveScale) {
+  const cx = charger.x;
+  const cy = charger.y;
+  const ramAng = charger.chargerRamAngle;
+  const sweepPad = 8;
+  const corridorR = charger.radius + sweepPad;
+
+  for (const victim of state.enemies) {
+    if (victim.id === charger.id || victim.kind === "boss") {
+      continue;
+    }
+    if (victim.kind === "hunter" && (victim.hunterPinLeft || 0) > 0) {
+      continue;
+    }
+    const victimCryoRooted = victim.slowTimer > 0 && (victim.slowMultiplier || 1) < 0.02;
+    if (victimCryoRooted) {
+      continue;
+    }
+
+    const distSeg = distPointToSegment(victim.x, victim.y, prevX, prevY, cx, cy);
+    if (distSeg > victim.radius + corridorR) {
+      continue;
+    }
+
+    const sdx = cx - prevX;
+    const sdy = cy - prevY;
+    const lenSq = sdx * sdx + sdy * sdy;
+    let px;
+    let py;
+    if (lenSq < 1e-8) {
+      px = cx;
+      py = cy;
+    } else {
+      let t = ((victim.x - prevX) * sdx + (victim.y - prevY) * sdy) / lenSq;
+      t = clamp(t, 0, 1);
+      px = prevX + t * sdx;
+      py = prevY + t * sdy;
+    }
+    let ox = victim.x - px;
+    let oy = victim.y - py;
+    let od = Math.hypot(ox, oy);
+    const targetSep = victim.radius + corridorR;
+    const baseKick = Math.min(36 + stepLen * 0.35, 58) * (0.85 + moveScale * 0.15);
+    if (od < 1e-4) {
+      const side = victim.id % 2 === 0 ? 1 : -1;
+      ox = Math.cos(ramAng + (Math.PI / 2) * side);
+      oy = Math.sin(ramAng + (Math.PI / 2) * side);
+      od = 1;
+    }
+    const push = baseKick + Math.max(0, targetSep - od) * 0.95;
+    victim.x += (ox / od) * push;
+    victim.y += (oy / od) * push;
+
+    if (victim.cage) {
+      clampEnemyToCage(victim);
+    }
+
+    applySlowToEnemy(victim, 0.52, 0.42, { skipShock: false });
+  }
+}
+
 function updateLaserAim(weapon, stats, player) {
   let aim = null;
   if (weapon.laserTargetId != null) {
     const locked = state.enemies.find((e) => e.id === weapon.laserTargetId);
-    if (locked) {
+    if (locked && canPlayerDamageEnemy(locked)) {
       const d = Math.hypot(locked.x - player.x, locked.y - player.y);
       if (d <= stats.range) {
         aim = locked;
@@ -3121,12 +3988,19 @@ function applyLaserBeamDamage(weapon, stats, dt) {
 
   for (let j = state.enemies.length - 1; j >= 0; j -= 1) {
     const enemy = state.enemies[j];
+    if (!canPlayerDamageEnemy(enemy)) {
+      continue;
+    }
     const distSeg = distPointToSegment(enemy.x, enemy.y, ox, oy, ex, ey);
     if (distSeg > enemy.radius + stats.beamHalfWidth) {
       continue;
     }
     hitAny = true;
     enemy.hp -= dmg;
+    aggroWitchFromPlayerAction(enemy);
+    if ((enemy.kind === "charger" || enemy.kind === "witch") && dmg > 0.12) {
+      playSound(enemy.kind === "charger" ? "chargerHit" : "witchHit");
+    }
     enemy.laserFlash = 0.08;
     spawnLaserHitParticles(enemy, stats, weapon.laserAngle);
     if (enemy.hp <= 0) {
@@ -3376,6 +4250,9 @@ function applyChainDamage(sourceX, sourceY, projectile, initialTargetId) {
       if (visitedIds.has(enemy.id)) {
         continue;
       }
+      if (!canPlayerDamageEnemy(enemy)) {
+        continue;
+      }
       const score = scoreChainTarget(originX, originY, enemy, visitedIds, projectile.chainRange);
       if (score > bestScore) {
         bestScore = score;
@@ -3392,9 +4269,16 @@ function applyChainDamage(sourceX, sourceY, projectile, initialTargetId) {
     projectile.hitIds.add(nextEnemy.id);
     spawnChainArc(originX, originY, nextEnemy.x, nextEnemy.y, projectile.color);
     nextEnemy.hp -= damage;
+    aggroWitchFromPlayerAction(nextEnemy);
     applySlowToEnemy(nextEnemy, projectile.slowMultiplier, projectile.slowDuration);
     spawnFloatingText(nextEnemy.x, nextEnemy.y - nextEnemy.radius, `-${Math.round(damage)}`, "#9cf7ff");
-    playSound("plasmaHit");
+    if (nextEnemy.kind === "charger") {
+      playSound("chargerHit");
+    } else if (nextEnemy.kind === "witch") {
+      playSound("witchHit");
+    } else {
+      playSound("plasmaHit");
+    }
 
     if (nextEnemy.hp <= 0) {
       handleEnemyDeath(nextEnemy, nextIndex);
@@ -3461,6 +4345,18 @@ function tryStartDash() {
     return;
   }
   const player = state.player;
+  if (player.smokerTetherEnemyId != null) {
+    const sm = state.enemies.find((e) => e.id === player.smokerTetherEnemyId && e.kind === "smoker");
+    if (sm) {
+      releaseSmokerTongue(sm, player);
+    } else {
+      player.smokerTetherEnemyId = null;
+      player.smokerChokeCd = 0;
+    }
+  }
+  if (isPlayerHunterPinned(player)) {
+    return;
+  }
   if (player.dashTimeLeft > 0 || player.dashCooldown > 0) {
     return;
   }
@@ -3490,21 +4386,113 @@ function updatePlayer(dt) {
   const player = state.player;
   const input = getMoveInput();
 
+  if (!isPlayerHunterPinned(player) && player.hunterPinEnemyId != null) {
+    player.hunterPinEnemyId = null;
+    player.hunterBreakProgress = 0;
+  }
+
+  if (player.smokerTetherEnemyId != null && !getActiveSmokerTetherEnemy(player)) {
+    player.smokerTetherEnemyId = null;
+    player.smokerChokeCd = 0;
+  }
+
   player.dashCooldown = Math.max(0, player.dashCooldown - dt);
+
+  const pinned = isPlayerHunterPinned(player);
+  if (pinned) {
+    player.hunterBreakProgress = Math.max(0, player.hunterBreakProgress - dt * 0.2);
+  } else {
+    player.hunterBreakProgress = 0;
+  }
+
+  const acidOverlap = getPlayerAcidPoolOverlap(player);
+  const acidMoveMul = acidOverlap.inAny ? acidOverlap.moveMul : 1;
+
+  const smokerEnemy = !pinned ? getActiveSmokerTetherEnemy(player) : null;
+  let smokerPullX = 0;
+  let smokerPullY = 0;
+  if (smokerEnemy) {
+    const sdx = smokerEnemy.x - player.x;
+    const sdy = smokerEnemy.y - player.y;
+    const sdist = Math.hypot(sdx, sdy) || 1;
+    const pull = 128 * dt;
+    smokerPullX = (sdx / sdist) * pull;
+    smokerPullY = (sdy / sdist) * pull;
+    player.smokerChokeCd = Math.max(0, (player.smokerChokeCd || 0) - dt);
+    if (player.smokerChokeCd <= 0) {
+      player.smokerChokeCd = 0.38;
+      const tick = 2.8 + state.wave * 0.24;
+      if (player.invulnerableTimer <= 0 && player.dashInvulnLeft <= 0) {
+        player.hp -= tick;
+        player.invulnerableTimer = 0.14;
+        spawnFloatingText(player.x, player.y - 20, `-${Math.round(tick)}`, "#a8c4ff");
+        if (player.hp <= 0) {
+          if (tryPhoenixRevive()) {
+            player.hp = Math.max(1, Math.round(player.maxHp * 0.1));
+            releaseSmokerTongue(smokerEnemy, player);
+          } else {
+            player.hp = 0;
+            triggerGameOver();
+            return;
+          }
+        }
+      }
+    }
+  }
 
   if (player.dashTimeLeft > 0) {
     player.dashTimeLeft -= dt;
-    player.x += player.dashDirX * DASH_SPEED * dt;
-    player.y += player.dashDirY * DASH_SPEED * dt;
+    const dashMul = acidOverlap.inAny ? Math.max(0.55, acidMoveMul) : 1;
+    player.x += player.dashDirX * DASH_SPEED * dashMul * dt;
+    player.y += player.dashDirY * DASH_SPEED * dashMul * dt;
     player.facing = Math.atan2(player.dashDirY, player.dashDirX);
     spawnDashTrailParticles(player, dt);
-  } else {
-    player.x += input.x * player.moveSpeed * dt;
-    player.y += input.y * player.moveSpeed * dt;
+    if (smokerEnemy) {
+      player.x += smokerPullX * 0.42;
+      player.y += smokerPullY * 0.42;
+    }
+  } else if (!pinned) {
+    player.x += input.x * player.moveSpeed * acidMoveMul * dt + smokerPullX;
+    player.y += input.y * player.moveSpeed * acidMoveMul * dt + smokerPullY;
   }
 
   player.invulnerableTimer = Math.max(0, player.invulnerableTimer - dt);
   player.dashInvulnLeft = Math.max(0, player.dashInvulnLeft - dt);
+
+  if (acidOverlap.inAny && acidOverlap.dotDps > 0) {
+    const acidTickInterval = 0.42;
+    player.boomerAcidDotCd = Math.max(0, (player.boomerAcidDotCd || 0) - dt);
+    if (player.boomerAcidDotCd <= 0) {
+      player.boomerAcidDotCd = acidTickInterval;
+      const tick = acidOverlap.dotDps * acidTickInterval;
+      if (player.invulnerableTimer <= 0 && player.dashInvulnLeft <= 0) {
+        player.hp -= tick;
+        player.invulnerableTimer = 0.22;
+        spawnFloatingText(player.x, player.y - 18, `-${Math.round(tick)}`, "#c8f070");
+        if (player.hp <= 0) {
+          if (tryPhoenixRevive()) {
+            player.hp = Math.max(1, Math.round(player.maxHp * 0.1));
+          } else {
+            player.hp = 0;
+            triggerGameOver();
+            return;
+          }
+        }
+      }
+    }
+  } else {
+    player.boomerAcidDotCd = 0;
+  }
+
+  if (
+    !pinned
+    && state.pendingLevelUps > 0
+    && state.phase === "playing"
+    && state.runMode !== "training"
+  ) {
+    showLevelUp();
+    return;
+  }
 
   if (player.regen > 0) {
     player.hp = Math.min(player.maxHp, player.hp + player.regen * dt);
@@ -3560,6 +4548,181 @@ function createEnemy(kind, x, y) {
       slowMultiplier: 1,
       touchDamageCooldown: 0,
       summonTimer: 0,
+    };
+  }
+
+  if (kind === "hunter") {
+    return {
+      id: state.nextEnemyId++,
+      kind,
+      name: enemyDisplayName("hunter"),
+      x,
+      y,
+      radius: 11,
+      hp: 36 * waveScale,
+      maxHp: 36 * waveScale,
+      speed: 102 + state.wave * 2.6,
+      damage: 7 + state.wave * 0.35,
+      xpValue: 14,
+      tint: "#c77dff",
+      laserFlash: 0,
+      shockFlash: 0,
+      cryoFlash: 0,
+      slowTimer: 0,
+      slowMultiplier: 1,
+      touchDamageCooldown: 0,
+      summonTimer: 0,
+      hunterPhase: "chase",
+      hunterLeapCd: randomRange(0.4, 1.1),
+      hunterWindupLeft: 0,
+      hunterLeapLeft: 0,
+      hunterLeapAngle: 0,
+      hunterLeapSpeed: 820,
+      hunterLeapTargetX: x,
+      hunterLeapTargetY: y,
+      hunterLandingLeft: 0,
+      hunterPinLeft: 0,
+      hunterPinDamageCd: 0,
+      hunterPinSlotAngle: 0,
+      hunterPinDamagePerTick: 5 + state.wave * 0.55,
+    };
+  }
+
+  if (kind === "boomer") {
+    return {
+      id: state.nextEnemyId++,
+      kind,
+      name: enemyDisplayName("boomer"),
+      x,
+      y,
+      radius: 21,
+      hp: 58 * waveScale,
+      maxHp: 58 * waveScale,
+      speed: 46 + state.wave * 1.15,
+      damage: 9 + state.wave * 0.35,
+      xpValue: 12,
+      tint: "#c8f070",
+      laserFlash: 0,
+      shockFlash: 0,
+      cryoFlash: 0,
+      slowTimer: 0,
+      slowMultiplier: 1,
+      touchDamageCooldown: 0,
+      summonTimer: 0,
+    };
+  }
+
+  if (kind === "smoker") {
+    return {
+      id: state.nextEnemyId++,
+      kind,
+      name: enemyDisplayName("smoker"),
+      x,
+      y,
+      radius: 13,
+      hp: 48 * waveScale,
+      maxHp: 48 * waveScale,
+      speed: 58 + state.wave * 1.4,
+      damage: 8 + state.wave * 0.4,
+      xpValue: 15,
+      tint: "#7a8fb8",
+      laserFlash: 0,
+      shockFlash: 0,
+      cryoFlash: 0,
+      slowTimer: 0,
+      slowMultiplier: 1,
+      touchDamageCooldown: 0,
+      summonTimer: 0,
+      smokerTongueCd: randomRange(1.1, 2.2),
+      smokerWindupLeft: 0,
+      smokerTongueLeft: 0,
+    };
+  }
+
+  if (kind === "spitter") {
+    return {
+      id: state.nextEnemyId++,
+      kind,
+      name: enemyDisplayName("spitter"),
+      x,
+      y,
+      radius: 12,
+      hp: 40 * waveScale,
+      maxHp: 40 * waveScale,
+      speed: 72 + state.wave * 2,
+      damage: 7 + state.wave * 0.35,
+      xpValue: 13,
+      tint: "#8cffb4",
+      laserFlash: 0,
+      shockFlash: 0,
+      cryoFlash: 0,
+      slowTimer: 0,
+      slowMultiplier: 1,
+      touchDamageCooldown: 0,
+      summonTimer: 0,
+      spitterCd: randomRange(0.55, 1.15),
+      spitterWindupLeft: 0,
+    };
+  }
+
+  if (kind === "charger") {
+    return {
+      id: state.nextEnemyId++,
+      kind,
+      name: enemyDisplayName("charger"),
+      x,
+      y,
+      radius: 17,
+      hp: 88 * waveScale,
+      maxHp: 88 * waveScale,
+      speed: 64 + state.wave * 1.6,
+      damage: 11 + state.wave * 0.45,
+      xpValue: 19,
+      tint: "#f4a85c",
+      laserFlash: 0,
+      shockFlash: 0,
+      cryoFlash: 0,
+      slowTimer: 0,
+      slowMultiplier: 1,
+      touchDamageCooldown: 0,
+      summonTimer: 0,
+      chargerCd: randomRange(0.55, 1.35),
+      chargerWindupLeft: 0,
+      chargerStampedeLeft: 0,
+      chargerRecoverLeft: 0,
+      chargerRamAngle: 0,
+      chargerRamSpeed: 620 + state.wave * 14,
+      chargerRamDamage: 44 + state.wave * 1.55,
+      chargerSlamUsed: false,
+    };
+  }
+
+  if (kind === "witch") {
+    return {
+      id: state.nextEnemyId++,
+      kind,
+      name: enemyDisplayName("witch"),
+      x,
+      y,
+      radius: 10,
+      hp: 44 * waveScale,
+      maxHp: 44 * waveScale,
+      speed: 16 + state.wave * 0.45,
+      damage: 4 + state.wave * 0.22,
+      xpValue: 21,
+      tint: "#d4c4f5",
+      laserFlash: 0,
+      shockFlash: 0,
+      cryoFlash: 0,
+      slowTimer: 0,
+      slowMultiplier: 1,
+      touchDamageCooldown: 0,
+      summonTimer: 0,
+      witchAggro: false,
+      witchEnragedDamage: 32 + state.wave * 1.35,
+      witchEnragedSpeed: 172 + state.wave * 6,
+      witchEnragedRadius: 12,
+      witchIdlePhase: randomRange(0, TAU),
     };
   }
 
@@ -3668,7 +4831,49 @@ function getSpawnPositionAtViewportEdge(originX = state.player.x, originY = stat
   return { x, y };
 }
 
+function pickDesignerDebugEnemyKind() {
+  const cfg = DESIGN_DEBUG_SPAWN;
+  if (!cfg.enabled || !Array.isArray(cfg.pool) || cfg.pool.length === 0) {
+    return null;
+  }
+  const wave = typeof cfg.targetWave === "number" ? cfg.targetWave : 1;
+  if (state.wave !== wave) {
+    return null;
+  }
+  const chance = typeof cfg.chance === "number" ? cfg.chance : 0;
+  if (chance <= 0 || Math.random() >= chance) {
+    return null;
+  }
+  const pool = cfg.pool.filter((kind) => typeof kind === "string" && kind.length > 0);
+  if (!pool.length) {
+    return null;
+  }
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 function pickEnemyTypeForWave() {
+  const debugKind = pickDesignerDebugEnemyKind();
+  if (debugKind) {
+    return debugKind;
+  }
+  if (state.wave >= 8 && Math.random() < 0.034) {
+    return "witch";
+  }
+  if (state.wave >= 7 && Math.random() < 0.036) {
+    return "charger";
+  }
+  if (state.wave >= 6 && Math.random() < 0.048) {
+    return "smoker";
+  }
+  if (state.wave >= 5 && Math.random() < 0.055) {
+    return "spitter";
+  }
+  if (state.wave >= 4 && Math.random() < 0.065) {
+    return "boomer";
+  }
+  if (state.wave >= 3 && Math.random() < 0.085) {
+    return "hunter";
+  }
   const roll = Math.random();
   if (state.wave >= 5 && roll > 0.75) {
     return "brute";
@@ -3718,6 +4923,7 @@ function updateWave(dt) {
 
 function updateSpawning(dt) {
   state.spawnTimer += dt;
+  state.bileSurgeTimer = Math.max(0, state.bileSurgeTimer - dt);
 
   const baseInterval = Math.max(0.2, 0.9 - state.wave * 0.05);
   const interval = state.boss ? baseInterval * 1.25 : baseInterval;
@@ -3730,6 +4936,10 @@ function updateSpawning(dt) {
     }
 
     for (let i = 0; i < count; i += 1) {
+      spawnEnemy();
+    }
+    if (state.bileSurgeTimer > 0) {
+      spawnEnemy();
       spawnEnemy();
     }
   }
@@ -3760,6 +4970,57 @@ function spawnPickup(type, x, y, value = 0, sourceRadius = null) {
   state.pickups.push(pickup);
 }
 
+function spawnAcidPool(x, y, opts = {}) {
+  const life = typeof opts.life === "number" ? opts.life : 15;
+  const maxLife = typeof opts.maxLife === "number" ? opts.maxLife : life;
+  state.acidPools.push({
+    x,
+    y,
+    radius: typeof opts.radius === "number" ? opts.radius : 66,
+    life,
+    maxLife,
+    slowMul: typeof opts.slowMul === "number" ? opts.slowMul : 0.44,
+    dotDps: typeof opts.dotDps === "number" ? opts.dotDps : 8 + state.wave * 0.5,
+  });
+}
+
+function spawnBoomerAcidPool(x, y) {
+  spawnAcidPool(x, y, {
+    radius: 66,
+    life: 15,
+    maxLife: 15,
+    slowMul: 0.44,
+    dotDps: 8 + state.wave * 0.5,
+  });
+}
+
+function getPlayerAcidPoolOverlap(player) {
+  let inAny = false;
+  let moveMul = 1;
+  let dotDps = 0;
+  if (!player || !state.acidPools.length) {
+    return { inAny, moveMul, dotDps };
+  }
+  for (const pool of state.acidPools) {
+    const d = Math.hypot(player.x - pool.x, player.y - pool.y);
+    if (d <= pool.radius + player.radius - 3) {
+      inAny = true;
+      moveMul = Math.min(moveMul, pool.slowMul);
+      dotDps = Math.max(dotDps, pool.dotDps);
+    }
+  }
+  return { inAny, moveMul, dotDps };
+}
+
+function updateAcidPools(dt) {
+  for (let i = state.acidPools.length - 1; i >= 0; i -= 1) {
+    state.acidPools[i].life -= dt;
+    if (state.acidPools[i].life <= 0) {
+      state.acidPools.splice(i, 1);
+    }
+  }
+}
+
 function handleEnemyDeath(enemy, index) {
   if (state.runMode === "training" && enemy.cage) {
     const cage = enemy.cage;
@@ -3774,6 +5035,23 @@ function handleEnemyDeath(enemy, index) {
   state.kills += 1;
   awardKillScore(enemy);
   spawnPickup("xp", enemy.x, enemy.y, enemy.xpValue, enemy.radius);
+
+  if (state.player.hunterPinEnemyId === enemy.id) {
+    state.player.hunterPinEnemyId = null;
+    state.player.hunterBreakProgress = 0;
+  }
+
+  if (enemy.kind === "smoker" && state.player.smokerTetherEnemyId === enemy.id) {
+    releaseSmokerTongue(enemy, state.player);
+  }
+
+  if (enemy.kind === "boomer") {
+    spawnBoomerAcidPool(enemy.x, enemy.y);
+    if (state.runMode !== "training") {
+      state.bileSurgeTimer = Math.max(state.bileSurgeTimer, 9.5);
+      message.textContent = t("msg.boomerBile");
+    }
+  }
 
   if (enemy.kind === "boss") {
     spawnPickup("cache", enemy.x + 26, enemy.y - 12, 1);
@@ -3800,6 +5078,20 @@ function updateProjectiles(dt) {
     projectile.y += projectile.vy * dt;
     projectile.life -= dt;
 
+    if (projectile.kind === "spitterAcid") {
+      if (projectile.life <= 0) {
+        spawnAcidPool(projectile.x, projectile.y, {
+          radius: 50,
+          life: 6.75,
+          maxLife: 6.75,
+          slowMul: 0.5,
+          dotDps: 5.2 + state.wave * 0.42,
+        });
+        state.projectiles.splice(i, 1);
+      }
+      continue;
+    }
+
     let removeProjectile = projectile.life <= 0;
 
     for (let j = state.enemies.length - 1; j >= 0; j -= 1) {
@@ -3814,9 +5106,13 @@ function updateProjectiles(dt) {
       if (dist > enemy.radius + projectile.radius) {
         continue;
       }
+      if (!canPlayerDamageEnemy(enemy)) {
+        continue;
+      }
 
       projectile.hitIds.add(enemy.id);
       enemy.hp -= projectile.damage;
+      aggroWitchFromPlayerAction(enemy);
       if (projectile.kind === "plasma") {
         applySlowToEnemy(enemy, projectile.slowMultiplier, projectile.slowDuration);
         spawnChainArc(projectile.x, projectile.y, enemy.x, enemy.y, projectile.color);
@@ -3828,9 +5124,7 @@ function updateProjectiles(dt) {
         applyCryoSplash(enemy.x, enemy.y, projectile, enemy.id);
       }
       spawnFloatingText(enemy.x, enemy.y - enemy.radius, `-${Math.round(projectile.damage)}`, "#fff1a1");
-      playSound(
-        projectile.kind === "plasma" ? "plasmaHit" : projectile.kind === "cryo" ? "cryoHit" : "hit",
-      );
+      playProjectileHitOnEnemy(enemy, projectile.kind);
 
       if (projectile.kind === "plasma") {
         applyChainDamage(enemy.x, enemy.y, projectile, enemy.id);
@@ -3856,10 +5150,442 @@ function updateProjectiles(dt) {
   }
 }
 
+function applyHunterPinDamage(player, enemy, dt) {
+  enemy.hunterPinDamageCd = Math.max(0, (enemy.hunterPinDamageCd || 0) - dt);
+  if (enemy.hunterPinDamageCd > 0) {
+    return;
+  }
+  enemy.hunterPinDamageCd = 0.38;
+  const tick = enemy.hunterPinDamagePerTick ?? enemy.damage * 0.55;
+  if (player.invulnerableTimer <= 0 && player.dashInvulnLeft <= 0) {
+    player.hp -= tick;
+    player.invulnerableTimer = 0.12;
+    spawnFloatingText(player.x, player.y - 24, `-${Math.round(tick)}`, "#e8b7ff");
+    if (player.hp <= 0) {
+      if (tryPhoenixRevive()) {
+        player.hp = Math.max(1, Math.round(player.maxHp * 0.1));
+        enemy.hunterPinLeft = 0;
+        enemy.hunterPhase = "chase";
+        enemy.hunterLeapCd = 2.4;
+        player.hunterPinEnemyId = null;
+        player.hunterBreakProgress = 0;
+      } else {
+        player.hp = 0;
+        triggerGameOver();
+      }
+    }
+  }
+}
+
+function releaseHunterPin(enemy, player, escaped = false) {
+  if (!enemy || !player) {
+    return;
+  }
+  enemy.hunterPinLeft = 0;
+  enemy.hunterPhase = "landing";
+  enemy.hunterLandingLeft = 0.42;
+  enemy.hunterPinSlotAngle = 0;
+  enemy.hunterLeapCd = escaped ? 3.2 : 2.5;
+  enemy.touchDamageCooldown = Math.max(enemy.touchDamageCooldown || 0, 0.55);
+  const away = Math.atan2(enemy.y - player.y, enemy.x - player.x) || Math.random() * TAU;
+  enemy.x = player.x + Math.cos(away) * (player.radius + enemy.radius + 22);
+  enemy.y = player.y + Math.sin(away) * (player.radius + enemy.radius + 22);
+  if (player.hunterPinEnemyId === enemy.id) {
+    player.hunterPinEnemyId = null;
+  }
+  player.hunterBreakProgress = 0;
+}
+
+function startHunterPin(enemy, player) {
+  enemy.hunterLeapLeft = 0;
+  enemy.hunterLandingLeft = 0;
+  enemy.hunterPinLeft = 999;
+  enemy.hunterWindupLeft = 0;
+  enemy.hunterPhase = "pin";
+  enemy.hunterPinSlotAngle = Math.random() * TAU;
+  enemy.x = player.x + Math.cos(enemy.hunterPinSlotAngle) * 16;
+  enemy.y = player.y + Math.sin(enemy.hunterPinSlotAngle) * 16;
+  player.hunterPinEnemyId = enemy.id;
+  player.hunterBreakProgress = 0;
+  message.textContent = t("msg.hunterPin", { left: getHunterBreakPressesLeft(player) });
+  applyHunterPinDamage(player, enemy, 999);
+}
+
+function tryHunterBreakFree() {
+  const player = state.player;
+  const enemy = getActiveHunterPinEnemy(player);
+  if (!player || !enemy) {
+    return false;
+  }
+  player.hunterBreakProgress = Math.min(1, player.hunterBreakProgress + 0.17);
+  const left = getHunterBreakPressesLeft(player);
+  if (player.hunterBreakProgress >= 1) {
+    releaseHunterPin(enemy, player, true);
+    message.textContent = t("msg.hunterEscape");
+    return true;
+  }
+  message.textContent = t("msg.hunterPin", { left });
+  return true;
+}
+
+function fireSpitterGlob(enemy, player) {
+  const inp = getMoveInput();
+  const lead = 0.44;
+  const tx = player.x + inp.x * player.moveSpeed * lead;
+  const ty = player.y + inp.y * player.moveSpeed * lead;
+  const ang = Math.atan2(ty - enemy.y, tx - enemy.x);
+  const speed = 268 + state.wave * 10;
+  const dist = Math.hypot(tx - enemy.x, ty - enemy.y) || 1;
+  const life = clamp(dist / speed + 0.12, 0.32, 1.05);
+  spawnProjectile({
+    x: enemy.x + Math.cos(ang) * (enemy.radius + 5),
+    y: enemy.y + Math.sin(ang) * (enemy.radius + 5),
+    vx: Math.cos(ang) * speed,
+    vy: Math.sin(ang) * speed,
+    radius: 7,
+    damage: 0,
+    color: "#62f0a8",
+    life,
+    pierce: 0,
+    kind: "spitterAcid",
+  });
+  playSound("shoot");
+}
+
+function updateSpitterEnemy(enemy, dt, player, moveScale, cryoRooted) {
+  const dx = player.x - enemy.x;
+  const dy = player.y - enemy.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  const angTo = Math.atan2(dy, dx);
+
+  enemy.spitterCd = Math.max(0, (enemy.spitterCd || 0) - dt);
+
+  if (enemy.spitterWindupLeft > 0) {
+    enemy.spitterWindupLeft -= dt;
+    if (enemy.spitterWindupLeft <= 0) {
+      fireSpitterGlob(enemy, player);
+      enemy.spitterCd = 1.45 + randomRange(0, 0.75);
+    }
+    return;
+  }
+
+  if (!cryoRooted && enemy.spitterCd <= 0 && dist > 115 && dist < 360) {
+    enemy.spitterWindupLeft = 0.4;
+    return;
+  }
+
+  let moveAng = angTo;
+  if (dist < 150) {
+    moveAng += Math.PI;
+  } else if (dist > 400) {
+    moveAng = angTo;
+  } else {
+    moveAng = angTo + Math.sin(state.elapsed * 2.4 + enemy.id * 0.7) * 0.55;
+  }
+  const pace = dist < 150 ? 0.92 : dist > 400 ? 0.62 : 0.78;
+  enemy.x += Math.cos(moveAng) * enemy.speed * moveScale * pace * dt;
+  enemy.y += Math.sin(moveAng) * enemy.speed * moveScale * pace * dt;
+}
+
+function witchIsProvokedByEnvironment(enemy, player) {
+  const d = Math.hypot(player.x - enemy.x, player.y - enemy.y);
+  if (d < 84) {
+    return true;
+  }
+  for (let pi = 0; pi < state.projectiles.length; pi += 1) {
+    const p = state.projectiles[pi];
+    if (p.kind === "spitterAcid") {
+      continue;
+    }
+    if (Math.hypot(p.x - enemy.x, p.y - enemy.y) < 52) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function updateWitchEnemy(enemy, dt, player, moveScale, cryoRooted) {
+  const dx = player.x - enemy.x;
+  const dy = player.y - enemy.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  const angle = Math.atan2(dy, dx);
+
+  if (!enemy.witchAggro) {
+    if (witchIsProvokedByEnvironment(enemy, player)) {
+      aggroWitchFromPlayerAction(enemy);
+    }
+    if (!enemy.witchAggro) {
+      enemy.witchIdlePhase = (enemy.witchIdlePhase || 0) + dt * 1.85;
+      const wob = enemy.speed * moveScale * 0.28;
+      enemy.x += Math.cos(enemy.witchIdlePhase + enemy.id * 0.4) * wob * dt;
+      enemy.y += Math.sin(enemy.witchIdlePhase * 0.88 + enemy.id * 0.2) * wob * dt * 0.75;
+      return;
+    }
+  }
+
+  enemy.x += Math.cos(angle) * enemy.speed * moveScale * dt;
+  enemy.y += Math.sin(angle) * enemy.speed * moveScale * dt;
+}
+
+function updateChargerEnemy(enemy, dt, player, moveScale, cryoRooted) {
+  const dx = player.x - enemy.x;
+  const dy = player.y - enemy.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  const angle = Math.atan2(dy, dx);
+
+  enemy.chargerCd = Math.max(0, (enemy.chargerCd || 0) - dt);
+
+  if (cryoRooted) {
+    if ((enemy.chargerWindupLeft || 0) > 0) {
+      enemy.chargerWindupLeft = 0;
+      enemy.chargerCd = Math.max(enemy.chargerCd, 0.85);
+    }
+    if ((enemy.chargerStampedeLeft || 0) > 0) {
+      enemy.chargerStampedeLeft = 0;
+      enemy.chargerRecoverLeft = 1.15;
+      enemy.chargerCd = Math.max(enemy.chargerCd, 2.1);
+    }
+  }
+
+  if ((enemy.chargerRecoverLeft || 0) > 0) {
+    enemy.chargerRecoverLeft -= dt;
+    enemy.x += Math.cos(angle) * enemy.speed * moveScale * 0.4 * dt;
+    enemy.y += Math.sin(angle) * enemy.speed * moveScale * 0.4 * dt;
+    return;
+  }
+
+  if ((enemy.chargerStampedeLeft || 0) > 0) {
+    const sp = (enemy.chargerRamSpeed || 620) * moveScale;
+    const ramAng = enemy.chargerRamAngle;
+    const prevX = enemy.x;
+    const prevY = enemy.y;
+    const stepLen = sp * dt;
+    enemy.x += Math.cos(ramAng) * stepLen;
+    enemy.y += Math.sin(ramAng) * stepLen;
+    applyChargerStampedeCollisionOthers(enemy, prevX, prevY, stepLen, moveScale);
+
+    const pd = Math.hypot(player.x - enemy.x, player.y - enemy.y);
+    const hitR = enemy.radius + player.radius + 8;
+    if (pd <= hitR && !enemy.chargerSlamUsed) {
+      enemy.chargerSlamUsed = true;
+      playSound("chargerRam");
+      const slam = enemy.chargerRamDamage || 40;
+      if (player.invulnerableTimer <= 0 && player.dashInvulnLeft <= 0) {
+        player.hp -= slam;
+        player.invulnerableTimer = 0.52;
+        message.textContent = t("msg.playerHit");
+        spawnFloatingText(player.x, player.y - 24, `-${Math.round(slam)}`, "#ffb28a");
+        if (player.hp <= 0) {
+          if (tryPhoenixRevive()) {
+            player.hp = Math.max(1, Math.round(player.maxHp * 0.1));
+          } else {
+            player.hp = 0;
+            triggerGameOver();
+            return;
+          }
+        }
+      }
+      enemy.chargerStampedeLeft = 0;
+      enemy.chargerRecoverLeft = 1.42;
+      enemy.chargerCd = 2.65;
+      return;
+    }
+
+    enemy.chargerStampedeLeft -= dt;
+    if (enemy.chargerStampedeLeft <= 0) {
+      enemy.chargerRecoverLeft = 1.28;
+      enemy.chargerCd = 2.35;
+    }
+    return;
+  }
+
+  if ((enemy.chargerWindupLeft || 0) > 0) {
+    enemy.chargerWindupLeft -= dt;
+    if (enemy.chargerWindupLeft <= 0) {
+      enemy.chargerRamAngle = Math.atan2(player.y - enemy.y, player.x - enemy.x);
+      enemy.chargerStampedeLeft = 0.54;
+      enemy.chargerSlamUsed = false;
+      playSound("chargerCharge");
+    }
+    return;
+  }
+
+  if (!cryoRooted && enemy.chargerCd <= 0 && dist > 128 && dist < 312) {
+    enemy.chargerWindupLeft = 0.58;
+    playSound("chargerWindup");
+    return;
+  }
+
+  enemy.x += Math.cos(angle) * enemy.speed * moveScale * dt;
+  enemy.y += Math.sin(angle) * enemy.speed * moveScale * dt;
+}
+
+function updateSmokerEnemy(enemy, dt, player, moveScale, cryoRooted) {
+  const dx = player.x - enemy.x;
+  const dy = player.y - enemy.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  const ang = Math.atan2(dy, dx);
+
+  enemy.smokerTongueCd = Math.max(0, (enemy.smokerTongueCd || 0) - dt);
+
+  if (enemy.smokerWindupLeft > 0) {
+    enemy.smokerWindupLeft -= dt;
+    if (enemy.smokerWindupLeft <= 0) {
+      enemy.smokerTongueLeft = 3.65;
+      player.smokerTetherEnemyId = enemy.id;
+      player.smokerChokeCd = 0.32;
+      message.textContent = t("msg.smokerTongue");
+      playSound("smokerTether");
+    }
+    return;
+  }
+
+  if (enemy.smokerTongueLeft > 0) {
+    enemy.smokerTongueLeft -= dt;
+    if (dist > 540) {
+      releaseSmokerTongue(enemy, player);
+      return;
+    }
+    if (enemy.smokerTongueLeft <= 0) {
+      releaseSmokerTongue(enemy, player);
+    }
+    return;
+  }
+
+  if (!cryoRooted && enemy.smokerTongueCd <= 0 && dist > 195 && dist < 505) {
+    enemy.smokerWindupLeft = 0.58;
+    return;
+  }
+
+  enemy.x += Math.cos(ang) * enemy.speed * moveScale * dt;
+  enemy.y += Math.sin(ang) * enemy.speed * moveScale * dt;
+}
+
+function startHunterLeap(enemy, player) {
+  const weaponR = getMaxPlayerWeaponRange(player);
+  const accurateLock = Math.random() < 0.5;
+  const missRadius = accurateLock
+    ? randomRange(0, Math.max(4, player.radius * 0.28))
+    : randomRange(player.radius + enemy.radius + 6, player.radius + enemy.radius + 24);
+  const missAngle = Math.random() * TAU;
+  enemy.hunterLeapTargetX = player.x + Math.cos(missAngle) * missRadius;
+  enemy.hunterLeapTargetY = player.y + Math.sin(missAngle) * missRadius;
+
+  const gap = Math.hypot(enemy.hunterLeapTargetX - enemy.x, enemy.hunterLeapTargetY - enemy.y);
+  const overlap = (enemy.radius + player.radius) * 0.42;
+  const maxTravel = Math.min(720, weaponR * 1.28 + 110);
+  const travel = clamp(gap - overlap, 76, maxTravel);
+  const maxSp = 1460;
+  const minSp = 760;
+  let dur = clamp(0.17 + travel / 1800, 0.18, 0.34);
+  let sp = travel / dur;
+  if (sp > maxSp) {
+    sp = maxSp;
+    dur = travel / sp;
+  } else if (sp < minSp) {
+    sp = minSp;
+    dur = travel / sp;
+    dur = Math.min(dur, 0.36);
+    sp = travel / dur;
+  }
+  enemy.hunterLeapSpeed = sp;
+  enemy.hunterLeapLeft = dur;
+  enemy.hunterLeapAngle = Math.atan2(
+    enemy.hunterLeapTargetY - enemy.y,
+    enemy.hunterLeapTargetX - enemy.x,
+  );
+}
+
+function updateHunterEnemy(enemy, dt, player, moveScale, cryoRooted) {
+  const dx = player.x - enemy.x;
+  const dy = player.y - enemy.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  const angle = Math.atan2(dy, dx);
+  const weaponR = getMaxPlayerWeaponRange(player);
+  const leapBandMax = weaponR * 1.14 + 52;
+  const leapBandMin = clamp(weaponR * 0.2 + 32, 48, 118);
+
+  enemy.hunterLeapCd = Math.max(0, (enemy.hunterLeapCd || 0) - dt);
+
+  if ((enemy.hunterLandingLeft || 0) > 0) {
+    enemy.hunterPhase = "landing";
+    enemy.hunterLandingLeft = Math.max(0, enemy.hunterLandingLeft - dt);
+    if (enemy.hunterLandingLeft <= 0) {
+      enemy.hunterPhase = "chase";
+    }
+    return;
+  }
+
+  if (enemy.hunterPinLeft > 0) {
+    enemy.hunterPhase = "pin";
+    if (!enemy.hunterPinSlotAngle) {
+      enemy.hunterPinSlotAngle = Math.random() * TAU;
+    }
+    enemy.x = player.x + Math.cos(enemy.hunterPinSlotAngle) * 16;
+    enemy.y = player.y + Math.sin(enemy.hunterPinSlotAngle) * 16;
+    player.hunterPinEnemyId = enemy.id;
+    applyHunterPinDamage(player, enemy, dt);
+    return;
+  }
+
+  if (enemy.hunterLeapLeft > 0) {
+    enemy.hunterPhase = "leap";
+    const sp = (enemy.hunterLeapSpeed || 820) * moveScale;
+    enemy.x += Math.cos(enemy.hunterLeapAngle) * sp * dt;
+    enemy.y += Math.sin(enemy.hunterLeapAngle) * sp * dt;
+    enemy.hunterLeapLeft -= dt;
+    const hitR = enemy.radius + player.radius + 2;
+    if (
+      !player.hunterPinEnemyId
+      && Math.hypot(player.x - enemy.x, player.y - enemy.y) <= hitR
+    ) {
+      startHunterPin(enemy, player);
+      return;
+    }
+    const lockedGap = Math.hypot(
+      enemy.hunterLeapTargetX - enemy.x,
+      enemy.hunterLeapTargetY - enemy.y,
+    );
+    if (enemy.hunterLeapLeft <= 0 || lockedGap <= Math.max(12, enemy.radius * 0.85)) {
+      enemy.hunterPhase = "chase";
+      enemy.hunterLeapCd = 1.45;
+    }
+    return;
+  }
+
+  if (enemy.hunterWindupLeft > 0) {
+    enemy.hunterPhase = "windup";
+    if (cryoRooted) {
+      enemy.hunterWindupLeft = 0;
+      enemy.hunterPhase = "chase";
+      enemy.hunterLeapCd = 0.65;
+      return;
+    }
+    enemy.hunterWindupLeft -= dt;
+    if (enemy.hunterWindupLeft <= 0) {
+      startHunterLeap(enemy, player);
+    }
+    return;
+  }
+
+  enemy.hunterPhase = "chase";
+  if (!cryoRooted && enemy.hunterLeapCd <= 0 && dist > leapBandMin && dist < leapBandMax) {
+    enemy.hunterWindupLeft = 0.34;
+    enemy.hunterPhase = "windup";
+    return;
+  }
+
+  enemy.x += Math.cos(angle) * enemy.speed * moveScale * dt;
+  enemy.y += Math.sin(angle) * enemy.speed * moveScale * dt;
+}
+
 function updateEnemies(dt) {
   const player = state.player;
 
   for (let i = state.enemies.length - 1; i >= 0; i -= 1) {
+    if (state.phase !== "playing") {
+      return;
+    }
     const enemy = state.enemies[i];
     const dx = player.x - enemy.x;
     const dy = player.y - enemy.y;
@@ -3884,6 +5610,21 @@ function updateEnemies(dt) {
       enemy.x += (tx / len) * enemy.speed * moveScale * 0.48 * dt;
       enemy.y += (ty / len) * enemy.speed * moveScale * 0.48 * dt;
       clampEnemyToCage(enemy);
+    } else if (enemy.kind === "hunter") {
+      const cryoRooted = enemy.slowTimer > 0 && (enemy.slowMultiplier || 1) < 0.02;
+      updateHunterEnemy(enemy, dt, player, moveScale, cryoRooted);
+    } else if (enemy.kind === "smoker") {
+      const cryoRooted = enemy.slowTimer > 0 && (enemy.slowMultiplier || 1) < 0.02;
+      updateSmokerEnemy(enemy, dt, player, moveScale, cryoRooted);
+    } else if (enemy.kind === "spitter") {
+      const cryoRooted = enemy.slowTimer > 0 && (enemy.slowMultiplier || 1) < 0.02;
+      updateSpitterEnemy(enemy, dt, player, moveScale, cryoRooted);
+    } else if (enemy.kind === "charger") {
+      const cryoRooted = enemy.slowTimer > 0 && (enemy.slowMultiplier || 1) < 0.02;
+      updateChargerEnemy(enemy, dt, player, moveScale, cryoRooted);
+    } else if (enemy.kind === "witch") {
+      const cryoRooted = enemy.slowTimer > 0 && (enemy.slowMultiplier || 1) < 0.02;
+      updateWitchEnemy(enemy, dt, player, moveScale, cryoRooted);
     } else {
       enemy.x += Math.cos(angle) * enemy.speed * moveScale * dt;
       enemy.y += Math.sin(angle) * enemy.speed * moveScale * dt;
@@ -3919,8 +5660,25 @@ function updateEnemies(dt) {
     }
 
     const dist = Math.hypot(dx, dy);
+    const skipHunterTouch =
+      enemy.kind === "hunter"
+      && (
+        (enemy.hunterPinLeft || 0) > 0
+        || (enemy.hunterLeapLeft || 0) > 0
+        || (enemy.hunterWindupLeft || 0) > 0
+        || (enemy.hunterLandingLeft || 0) > 0
+      );
+    const skipSmokerTouch =
+      enemy.kind === "smoker"
+      && ((enemy.smokerWindupLeft || 0) > 0 || (enemy.smokerTongueLeft || 0) > 0);
+    const skipChargerTouch =
+      enemy.kind === "charger"
+      && ((enemy.chargerWindupLeft || 0) > 0 || (enemy.chargerStampedeLeft || 0) > 0);
     if (
       !enemy.cage
+      && !skipHunterTouch
+      && !skipSmokerTouch
+      && !skipChargerTouch
       && dist <= enemy.radius + player.radius + 4
       && enemy.touchDamageCooldown <= 0
     ) {
@@ -3930,6 +5688,11 @@ function updateEnemies(dt) {
         player.invulnerableTimer = 0.35;
         message.textContent = t("msg.playerHit");
         spawnFloatingText(player.x, player.y - 24, `-${Math.round(enemy.damage)}`, "#ffb7b7");
+        if (enemy.kind === "witch") {
+          playSound("witchAttack");
+        } else if (enemy.kind === "charger") {
+          playSound("chargerAttack");
+        }
 
         if (player.hp <= 0) {
           if (tryPhoenixRevive()) {
@@ -4079,7 +5842,12 @@ function gainXp(amount) {
     state.pendingLevelUps += 1;
   }
 
-  if (state.pendingLevelUps > 0 && state.phase === "playing" && state.runMode !== "training") {
+  if (
+    state.pendingLevelUps > 0
+    && state.phase === "playing"
+    && state.runMode !== "training"
+    && !isPlayerHunterPinned(player)
+  ) {
     showLevelUp();
   }
 }
@@ -4180,7 +5948,11 @@ function buildUpgradeChoices() {
 }
 
 function showLevelUp() {
-  if (state.pendingLevelUps <= 0 || state.phase === "gameover") {
+  if (
+    state.pendingLevelUps <= 0
+    || state.phase === "gameover"
+    || isPlayerHunterPinned(state.player)
+  ) {
     return;
   }
 
@@ -4286,6 +6058,7 @@ function update(dt) {
   updateProjectiles(dt);
   updateEnemies(dt);
   updatePickups(dt);
+  updateAcidPools(dt);
   updateFloatingTexts(dt);
   updateCombo(dt);
   updateDashTrailParticles(dt);
@@ -4337,6 +6110,37 @@ function drawGrid(cameraX, cameraY) {
     ctx.moveTo(0, y - cameraY + canvas.height / 2);
     ctx.lineTo(canvas.width, y - cameraY + canvas.height / 2);
     ctx.stroke();
+  }
+}
+
+function drawAcidPools(cameraX, cameraY) {
+  for (const pool of state.acidPools) {
+    const sx = pool.x - cameraX + canvas.width / 2;
+    const sy = pool.y - cameraY + canvas.height / 2;
+    const t = clamp(pool.life / pool.maxLife, 0, 1);
+    const pulse = 0.5 + 0.5 * Math.sin(state.elapsed * 5.5 + pool.x * 0.02);
+    const r = pool.radius * (0.92 + pulse * 0.06);
+
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const g = ctx.createRadialGradient(sx, sy, r * 0.12, sx, sy, r);
+    g.addColorStop(0, `rgba(200, 255, 120, ${0.22 + t * 0.18})`);
+    g.addColorStop(0.45, `rgba(120, 200, 60, ${0.14 + t * 0.12})`);
+    g.addColorStop(1, `rgba(40, 80, 20, 0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(sx, sy, r, 0, TAU);
+    ctx.fill();
+
+    ctx.globalCompositeOperation = "source-over";
+    ctx.strokeStyle = `rgba(190, 255, 130, ${0.18 + t * 0.22})`;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 8]);
+    ctx.beginPath();
+    ctx.arc(sx, sy, r * 0.88, 0, TAU);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
   }
 }
 
@@ -4413,6 +6217,21 @@ function drawProjectiles(cameraX, cameraY) {
       ctx.fillStyle = "rgba(255, 255, 255, 0.88)";
       ctx.beginPath();
       ctx.arc(sx - projectile.radius * 0.25, sy - projectile.radius * 0.25, Math.max(1.4, projectile.radius * 0.35), 0, TAU);
+      ctx.fill();
+      ctx.restore();
+      continue;
+    }
+    if (projectile.kind === "spitterAcid") {
+      ctx.save();
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = "rgba(80, 255, 160, 0.45)";
+      ctx.fillStyle = hexToRgba(projectile.color, 0.9);
+      ctx.beginPath();
+      ctx.ellipse(sx, sy, projectile.radius * 1.1, projectile.radius * 0.82, 0, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = "rgba(220, 255, 230, 0.75)";
+      ctx.beginPath();
+      ctx.arc(sx - 1.5, sy - 1.5, Math.max(1.5, projectile.radius * 0.35), 0, TAU);
       ctx.fill();
       ctx.restore();
       continue;
@@ -4549,11 +6368,86 @@ function drawEnemies(cameraX, cameraY) {
       ctx.stroke();
     }
 
-    if (enemy.kind === "brute" || enemy.kind === "boss") {
+    if (enemy.kind === "hunter" && ((enemy.hunterWindupLeft || 0) > 0 || (enemy.hunterLeapLeft || 0) > 0)) {
+      const pulse = 0.5 + 0.5 * Math.sin(state.elapsed * 14 + enemy.id);
+      ctx.strokeStyle = `rgba(230, 170, 255, ${0.45 + pulse * 0.35})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius + 8 + pulse * 3, 0, TAU);
+      ctx.stroke();
+    }
+
+    if (enemy.kind === "hunter" && (enemy.hunterLandingLeft || 0) > 0) {
+      const t = Math.min(1, enemy.hunterLandingLeft / 0.42);
+      ctx.strokeStyle = `rgba(255, 230, 255, ${0.24 + t * 0.38})`;
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius + 12 - t * 7, 0, TAU);
+      ctx.stroke();
+    }
+
+    if (enemy.kind === "charger" && ((enemy.chargerWindupLeft || 0) > 0 || (enemy.chargerStampedeLeft || 0) > 0)) {
+      const pulse = 0.5 + 0.5 * Math.sin(state.elapsed * 16 + enemy.id);
+      if ((enemy.chargerWindupLeft || 0) > 0) {
+        ctx.strokeStyle = `rgba(255, 190, 120, ${0.42 + pulse * 0.32})`;
+        ctx.lineWidth = 2.2;
+        ctx.setLineDash([4, 6]);
+        ctx.beginPath();
+        ctx.arc(x, y, enemy.radius + 10 + pulse * 4, 0, TAU);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      } else {
+        ctx.strokeStyle = `rgba(255, 220, 160, ${0.38 + pulse * 0.28})`;
+        ctx.lineWidth = 2.6;
+        ctx.beginPath();
+        ctx.arc(x, y, enemy.radius + 5 + pulse * 2, 0, TAU);
+        ctx.stroke();
+      }
+    }
+
+    if (enemy.kind === "witch" && !enemy.witchAggro) {
+      const calm = 0.22 + 0.08 * Math.sin(state.elapsed * 2.2 + enemy.id);
+      ctx.strokeStyle = `rgba(200, 180, 255, ${calm})`;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius + 7, 0, TAU);
+      ctx.stroke();
+    } else if (enemy.kind === "witch" && enemy.witchAggro) {
+      const rage = 0.5 + 0.5 * Math.sin(state.elapsed * 18 + enemy.id);
+      ctx.strokeStyle = `rgba(255, 110, 150, ${0.4 + rage * 0.38})`;
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.arc(x, y, enemy.radius + 9 + rage * 3, 0, TAU);
+      ctx.stroke();
+    }
+
+    if (enemy.kind === "smoker" && (enemy.smokerTongueLeft || 0) > 0) {
+      const px = state.player.x - cameraX + canvas.width / 2;
+      const py = state.player.y - cameraY + canvas.height / 2;
+      ctx.strokeStyle = "rgba(140, 190, 255, 0.55)";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 7]);
+      ctx.beginPath();
+      ctx.moveTo(x, y);
+      ctx.lineTo(px, py);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    if (enemy.kind === "brute" || enemy.kind === "boss" || enemy.kind === "boomer" || enemy.kind === "charger" || enemy.kind === "witch") {
       const hpWidth = enemy.radius * 2.4;
       ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
       ctx.fillRect(x - hpWidth / 2, y - enemy.radius - 12, hpWidth, 5);
-      ctx.fillStyle = enemy.kind === "boss" ? "#ff6d7f" : "#ffb067";
+      ctx.fillStyle =
+        enemy.kind === "boss"
+          ? "#ff6d7f"
+          : enemy.kind === "boomer"
+            ? "#d4f080"
+            : enemy.kind === "charger"
+              ? "#ffb84d"
+              : enemy.kind === "witch"
+                ? "#e8b0ff"
+                : "#ffb067";
       ctx.fillRect(x - hpWidth / 2, y - enemy.radius - 12, hpWidth * (enemy.hp / enemy.maxHp), 5);
     }
   }
@@ -4614,6 +6508,47 @@ function drawFloatingTexts(cameraX, cameraY) {
     ctx.fillStyle = hexToRgba(rgb, alpha);
     ctx.fillText(item.text, x, y);
   }
+}
+
+function drawHunterBreakMeter() {
+  const player = state.player;
+  if (!player || !isPlayerHunterPinned(player) || state.phase !== "playing") {
+    return;
+  }
+
+  const progress = clamp(player.hunterBreakProgress || 0, 0, 1);
+  const left = getHunterBreakPressesLeft(player);
+  const barW = Math.min(320, Math.max(220, canvas.width * 0.34));
+  const barH = 16;
+  const x = Math.round((canvas.width - barW) / 2);
+  const y = Math.round(canvas.height * 0.72);
+
+  ctx.save();
+  ctx.fillStyle = "rgba(10, 12, 22, 0.68)";
+  ctx.fillRect(x - 12, y - 34, barW + 24, 62);
+
+  ctx.textAlign = "center";
+  ctx.font = "bold 16px Arial";
+  ctx.fillStyle = "#f7e6ff";
+  ctx.fillText(t("msg.hunterPin", { left }), canvas.width / 2, y - 12);
+
+  ctx.fillStyle = "rgba(255, 255, 255, 0.16)";
+  ctx.fillRect(x, y, barW, barH);
+
+  const grad = ctx.createLinearGradient(x, y, x + barW, y);
+  grad.addColorStop(0, "#8c4dff");
+  grad.addColorStop(1, "#f58bff");
+  ctx.fillStyle = grad;
+  ctx.fillRect(x, y, barW * progress, barH);
+
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.55)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x, y, barW, barH);
+
+  ctx.font = "bold 13px Arial";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(`F x${left}`, canvas.width / 2, y + 40);
+  ctx.restore();
 }
 
 function drawWeaponWheel() {
@@ -4912,6 +6847,7 @@ function draw() {
     drawTrainingArena(cameraX, cameraY);
   }
   drawWeaponHints();
+  drawAcidPools(cameraX, cameraY);
   drawPickups(cameraX, cameraY);
   drawProjectiles(cameraX, cameraY);
   drawChainArcs(cameraX, cameraY);
@@ -4922,6 +6858,7 @@ function draw() {
   drawLaserBeams();
   drawPet(cameraX, cameraY);
   drawPlayer();
+  drawHunterBreakMeter();
   drawFloatingTexts(cameraX, cameraY);
   drawWaveBanner();
   drawWeaponWheel();
@@ -5028,6 +6965,7 @@ function gameLoop(now) {
   const dt = Math.min(0.033, (now - lastTime) / 1000);
   lastTime = now;
   update(dt);
+  syncProceduralBgm();
   draw();
   requestAnimationFrame(gameLoop);
 }
@@ -5054,6 +6992,16 @@ window.addEventListener("keydown", (event) => {
       return;
     }
     return;
+  }
+
+  if (key === "f" && state.phase === "playing" && state.player) {
+    if (!event.repeat) {
+      event.preventDefault();
+      if (tryHunterBreakFree()) {
+        keys.delete(key);
+        return;
+      }
+    }
   }
 
   if (!event.repeat) {
